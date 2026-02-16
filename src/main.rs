@@ -63,31 +63,17 @@ fn default_socket_path() -> PathBuf {
     PathBuf::from(format!("/tmp/tdesktop-{uid}/tdesktop.sock"))
 }
 
-fn read_json(arg: Option<String>) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let text = match arg {
-        Some(text) => text,
-        None => {
-            use std::io::Read;
-            let mut buf = String::new();
-            std::io::stdin().read_to_string(&mut buf)?;
-            buf
-        }
-    };
-
+fn parse_json(text: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let value: serde_json::Value = serde_json::from_str(text.trim())?;
     Ok(value)
 }
 
 async fn send_and_receive(
-    socket_path: &PathBuf,
-    message: serde_json::Value,
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    writer: &mut BufWriter<tokio::net::unix::OwnedWriteHalf>,
+    message: &serde_json::Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stream = UnixStream::connect(socket_path).await?;
-    let (reader, writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
-    let mut writer = BufWriter::new(writer);
-
-    let line = serde_json::to_string(&message)?;
+    let line = serde_json::to_string(message)?;
     writer.write_all(line.as_bytes()).await?;
     writer.write_all(b"\n").await?;
     writer.flush().await?;
@@ -100,28 +86,58 @@ async fn send_and_receive(
     Ok(())
 }
 
+enum Envelope {
+    None,
+    Tdlib,
+    Tdesktop,
+}
+
+fn wrap(envelope: &Envelope, payload: serde_json::Value) -> serde_json::Value {
+    match envelope {
+        Envelope::None => payload,
+        Envelope::Tdlib => serde_json::json!({ "type": "tdlib", "payload": payload }),
+        Envelope::Tdesktop => serde_json::json!({ "type": "tdesktop", "payload": payload }),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let socket_path = cli.socket.unwrap_or_else(default_socket_path);
 
-    let message = match cli.command {
-        Command::Raw { json } => read_json(json)?,
+    let (json_arg, envelope) = match cli.command {
+        Command::Raw { json } => (json, Envelope::None),
         Command::Tdlib { command } => match command {
-            TdlibCommand::Raw { json } => {
-                let payload = read_json(json)?;
-                serde_json::json!({ "type": "tdlib", "payload": payload })
-            }
+            TdlibCommand::Raw { json } => (json, Envelope::Tdlib),
         },
         Command::Tdesktop { command } => match command {
-            TdesktopCommand::Raw { json } => {
-                let payload = read_json(json)?;
-                serde_json::json!({ "type": "tdesktop", "payload": payload })
-            }
+            TdesktopCommand::Raw { json } => (json, Envelope::Tdesktop),
         },
     };
 
-    send_and_receive(&socket_path, message).await?;
+    let stream = UnixStream::connect(&socket_path).await?;
+    let (rd, wr) = stream.into_split();
+    let mut reader = BufReader::new(rd);
+    let mut writer = BufWriter::new(wr);
+
+    match json_arg {
+        Some(text) => {
+            let message = wrap(&envelope, parse_json(&text)?);
+            send_and_receive(&mut reader, &mut writer, &message).await?;
+        }
+        None => {
+            use std::io::BufRead;
+            let stdin = std::io::stdin().lock();
+            for line in stdin.lines() {
+                let line = line?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let message = wrap(&envelope, parse_json(&line)?);
+                send_and_receive(&mut reader, &mut writer, &message).await?;
+            }
+        }
+    }
 
     Ok(())
 }
