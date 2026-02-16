@@ -170,10 +170,7 @@ async fn test_tdlib_raw_envelope() {
 
     assert!(output.status.success());
     let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(
-        response,
-        serde_json::json!({"type": "tdlib", "payload": {"method": "getMe"}})
-    );
+    assert_eq!(response, serde_json::json!({"method": "getMe"}));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -186,10 +183,7 @@ async fn test_tdesktop_raw_envelope() {
 
     assert!(output.status.success());
     let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(
-        response,
-        serde_json::json!({"type": "tdesktop", "payload": {"action": "quit"}})
-    );
+    assert_eq!(response, serde_json::json!({"action": "quit"}));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

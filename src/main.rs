@@ -72,6 +72,7 @@ async fn send_and_receive(
     reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
     writer: &mut BufWriter<tokio::net::unix::OwnedWriteHalf>,
     message: &serde_json::Value,
+    envelope: &Envelope,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let line = serde_json::to_string(message)?;
     writer.write_all(line.as_bytes()).await?;
@@ -81,7 +82,14 @@ async fn send_and_receive(
     let mut response = String::new();
     reader.read_line(&mut response).await?;
 
-    print!("{response}");
+    match envelope {
+        Envelope::None => print!("{response}"),
+        _ => {
+            let parsed: serde_json::Value = serde_json::from_str(response.trim())?;
+            let payload = &parsed["payload"];
+            println!("{}", serde_json::to_string(payload)?);
+        }
+    }
 
     Ok(())
 }
@@ -123,7 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match json_arg {
         Some(text) => {
             let message = wrap(&envelope, parse_json(&text)?);
-            send_and_receive(&mut reader, &mut writer, &message).await?;
+            send_and_receive(&mut reader, &mut writer, &message, &envelope).await?;
         }
         None => {
             use std::io::BufRead;
@@ -134,7 +142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
                 let message = wrap(&envelope, parse_json(&line)?);
-                send_and_receive(&mut reader, &mut writer, &message).await?;
+                send_and_receive(&mut reader, &mut writer, &message, &envelope).await?;
             }
         }
     }
