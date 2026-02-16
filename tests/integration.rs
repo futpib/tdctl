@@ -42,6 +42,52 @@ async fn start_echo_server() -> MockServer {
     }
 }
 
+/// A mock server that, for each incoming line, sends several fake update lines
+/// (TDLib envelope with payloads that have no matching @extra) before echoing
+/// the original line back.
+async fn start_noisy_echo_server() -> MockServer {
+    let tempdir = TempDir::new().unwrap();
+    let socket_path = tempdir.path().join("test.sock");
+
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let (rd, mut wr) = stream.into_split();
+                let mut reader = BufReader::new(rd);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    let n = reader.read_line(&mut line).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    // Send fake updates before the real response
+                    let updates = [
+                        r#"{"type":"tdlib","payload":{"@type":"updateUser"}}"#,
+                        r#"{"type":"tdlib","payload":{"@type":"updateChat","@extra":"unrelated"}}"#,
+                        r#"{"type":"tdlib","payload":{"@type":"updateOption"}}"#,
+                    ];
+                    for update in &updates {
+                        wr.write_all(update.as_bytes()).await.unwrap();
+                        wr.write_all(b"\n").await.unwrap();
+                    }
+                    // Echo back the original line
+                    wr.write_all(line.as_bytes()).await.unwrap();
+                    wr.flush().await.unwrap();
+                }
+            });
+        }
+    });
+
+    MockServer {
+        socket_path,
+        _tempdir: tempdir,
+    }
+}
+
 fn tdctl_cmd(socket_path: &PathBuf) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_tdctl"));
     cmd.arg("--socket").arg(socket_path);
@@ -162,15 +208,31 @@ async fn test_raw_empty_lines_skipped() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_tdlib_raw_envelope() {
-    let server = start_echo_server().await;
+    let server = start_noisy_echo_server().await;
     let output = tdctl_cmd(&server.socket_path)
-        .args(["tdlib", "raw", r#"{"method":"getMe"}"#])
+        .args(["tdlib", "raw", r#"{"@type":"getMe","@extra":"1"}"#])
         .output()
         .unwrap();
 
     assert!(output.status.success());
     let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(response, serde_json::json!({"method": "getMe"}));
+    assert_eq!(response, serde_json::json!({"@type": "getMe", "@extra": "1"}));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_tdlib_raw_auto_extra() {
+    let server = start_noisy_echo_server().await;
+    let output = tdctl_cmd(&server.socket_path)
+        .args(["tdlib", "raw", r#"{"@type":"getMe"}"#])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["@type"], "getMe");
+    // Auto-injected @extra should be present
+    assert!(response.get("@extra").is_some());
+    assert!(response["@extra"].as_str().unwrap().starts_with("tdctl-"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

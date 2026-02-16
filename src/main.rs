@@ -1,8 +1,11 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::UnixStream;
+
+static EXTRA_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Parser)]
 #[command(about = "CLI client for tdesktop Unix socket API")]
@@ -73,21 +76,45 @@ async fn send_and_receive(
     writer: &mut BufWriter<tokio::net::unix::OwnedWriteHalf>,
     message: &serde_json::Value,
     envelope: &Envelope,
+    expected_extra: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let line = serde_json::to_string(message)?;
     writer.write_all(line.as_bytes()).await?;
     writer.write_all(b"\n").await?;
     writer.flush().await?;
 
-    let mut response = String::new();
-    reader.read_line(&mut response).await?;
-
     match envelope {
-        Envelope::None => print!("{response}"),
-        _ => {
+        Envelope::None => {
+            let mut response = String::new();
+            reader.read_line(&mut response).await?;
+            print!("{response}");
+        }
+        Envelope::Tdesktop => {
+            let mut response = String::new();
+            reader.read_line(&mut response).await?;
             let parsed: serde_json::Value = serde_json::from_str(response.trim())?;
             let payload = &parsed["payload"];
             println!("{}", serde_json::to_string(payload)?);
+        }
+        Envelope::Tdlib => {
+            loop {
+                let mut response = String::new();
+                let n = reader.read_line(&mut response).await?;
+                if n == 0 {
+                    return Err("unexpected EOF while waiting for response".into());
+                }
+                let parsed: serde_json::Value = serde_json::from_str(response.trim())?;
+                let payload = &parsed["payload"];
+                if let Some(extra) = expected_extra {
+                    if payload.get("@extra").and_then(|v| v.as_str()) == Some(extra) {
+                        println!("{}", serde_json::to_string(payload)?);
+                        break;
+                    }
+                } else {
+                    println!("{}", serde_json::to_string(payload)?);
+                    break;
+                }
+            }
         }
     }
 
@@ -98,6 +125,18 @@ enum Envelope {
     None,
     Tdlib,
     Tdesktop,
+}
+
+fn inject_extra(envelope: &Envelope, payload: &mut serde_json::Value) -> Option<String> {
+    if !matches!(envelope, Envelope::Tdlib) {
+        return None;
+    }
+    if payload.get("@extra").is_some() {
+        return payload["@extra"].as_str().map(|s| s.to_string());
+    }
+    let extra = format!("tdctl-{}", EXTRA_COUNTER.fetch_add(1, Ordering::Relaxed));
+    payload["@extra"] = serde_json::Value::String(extra.clone());
+    Some(extra)
 }
 
 fn wrap(envelope: &Envelope, payload: serde_json::Value) -> serde_json::Value {
@@ -130,8 +169,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match json_arg {
         Some(text) => {
-            let message = wrap(&envelope, parse_json(&text)?);
-            send_and_receive(&mut reader, &mut writer, &message, &envelope).await?;
+            let mut payload = parse_json(&text)?;
+            let extra = inject_extra(&envelope, &mut payload);
+            let message = wrap(&envelope, payload);
+            send_and_receive(&mut reader, &mut writer, &message, &envelope, extra.as_deref())
+                .await?;
         }
         None => {
             use std::io::BufRead;
@@ -141,8 +183,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if line.trim().is_empty() {
                     continue;
                 }
-                let message = wrap(&envelope, parse_json(&line)?);
-                send_and_receive(&mut reader, &mut writer, &message, &envelope).await?;
+                let mut payload = parse_json(&line)?;
+                let extra = inject_extra(&envelope, &mut payload);
+                let message = wrap(&envelope, payload);
+                send_and_receive(&mut reader, &mut writer, &message, &envelope, extra.as_deref())
+                    .await?;
             }
         }
     }
