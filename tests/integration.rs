@@ -293,6 +293,61 @@ async fn test_tdlib_raw_account_flag() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_tdesktop_list_accounts() {
+    let tempdir = TempDir::new().unwrap();
+    let socket_path = tempdir.path().join("test.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let (rd, mut wr) = stream.into_split();
+                let mut reader = BufReader::new(rd);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    let n = reader.read_line(&mut line).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    let envelope: serde_json::Value =
+                        serde_json::from_str(line.trim()).unwrap();
+                    let response = serde_json::json!({
+                        "type": envelope["type"],
+                        "payload": {
+                            "command": "listAccounts",
+                            "accounts": [
+                                {"index": 0, "first_name": "John", "last_name": "Doe", "username": "johndoe", "phone": "1234567890"},
+                                {"index": 1, "first_name": "Jane", "username": "jane"},
+                                {"index": 2}
+                            ]
+                        }
+                    });
+                    let response_str = serde_json::to_string(&response).unwrap();
+                    wr.write_all(response_str.as_bytes()).await.unwrap();
+                    wr.write_all(b"\n").await.unwrap();
+                    wr.flush().await.unwrap();
+                }
+            });
+        }
+    });
+
+    let output = tdctl_cmd(&socket_path)
+        .args(["list-accounts"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[0], "account 0\tJohn Doe\t@johndoe\t+1234567890");
+    assert_eq!(lines[1], "account 1\tJane\t@jane");
+    assert_eq!(lines[2], "account 2");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_raw_invalid_json_error() {
     let server = start_echo_server().await;
     let output = tdctl_cmd(&server.socket_path)

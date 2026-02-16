@@ -41,6 +41,9 @@ enum Command {
         #[command(subcommand)]
         command: TdesktopCommand,
     },
+
+    /// List available accounts
+    ListAccounts,
 }
 
 #[derive(Subcommand)]
@@ -180,20 +183,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket_path = cli.socket.unwrap_or_else(default_socket_path);
     let account = cli.account;
 
-    let (json_arg, envelope) = match cli.command {
-        Command::Raw { json } => (json, Envelope::None),
+    let (json_arg, envelope) = match &cli.command {
+        Command::Raw { json } => (json.clone(), Envelope::None),
         Command::Tdlib { command } => match command {
-            TdlibCommand::Raw { json } => (json, Envelope::Tdlib),
+            TdlibCommand::Raw { json } => (json.clone(), Envelope::Tdlib),
         },
         Command::Tdesktop { command } => match command {
-            TdesktopCommand::Raw { json } => (json, Envelope::Tdesktop),
+            TdesktopCommand::Raw { json } => (json.clone(), Envelope::Tdesktop),
         },
+        Command::ListAccounts => (None, Envelope::Tdesktop),
     };
 
     let stream = UnixStream::connect(&socket_path).await?;
     let (rd, wr) = stream.into_split();
     let mut reader = BufReader::new(rd);
     let mut writer = BufWriter::new(wr);
+
+    if matches!(cli.command, Command::ListAccounts) {
+        let payload = serde_json::json!({"command": "listAccounts"});
+        let message = wrap(&envelope, account, payload);
+        let line = serde_json::to_string(&message)?;
+        writer.write_all(line.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+
+        let mut response = String::new();
+        reader.read_line(&mut response).await?;
+        let parsed: serde_json::Value = serde_json::from_str(response.trim())?;
+        let payload = &parsed["payload"];
+
+        if let Some(accounts) = payload.get("accounts").and_then(|v| v.as_array()) {
+            for account in accounts {
+                let index = account.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                let mut parts = vec![format!("account {index}")];
+
+                if let Some(name) = account.get("first_name").and_then(|v| v.as_str()) {
+                    let full_name = match account.get("last_name").and_then(|v| v.as_str()) {
+                        Some(last) => format!("{name} {last}"),
+                        None => name.to_string(),
+                    };
+                    parts.push(full_name);
+                }
+
+                if let Some(username) = account.get("username").and_then(|v| v.as_str()) {
+                    parts.push(format!("@{username}"));
+                }
+
+                if let Some(phone) = account.get("phone").and_then(|v| v.as_str()) {
+                    parts.push(format!("+{phone}"));
+                }
+
+                println!("{}", parts.join("\t"));
+            }
+        }
+
+        return Ok(());
+    }
 
     match json_arg {
         Some(text) => {
