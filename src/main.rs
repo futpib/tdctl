@@ -104,14 +104,21 @@ async fn send_and_receive(
                     return Err("unexpected EOF while waiting for response".into());
                 }
                 let parsed: serde_json::Value = serde_json::from_str(response.trim())?;
-                let payload = &parsed["payload"];
+                let mut payload = parsed["payload"].clone();
                 if let Some(extra) = expected_extra {
-                    if payload.get("@extra").and_then(|v| v.as_str()) == Some(extra) {
-                        println!("{}", serde_json::to_string(payload)?);
+                    let matches = payload
+                        .get("@extra")
+                        .and_then(|v| v.get("tdctl"))
+                        .and_then(|v| v.as_str())
+                        == Some(extra);
+                    if matches {
+                        strip_extra(&mut payload);
+                        println!("{}", serde_json::to_string(&payload)?);
                         break;
                     }
                 } else {
-                    println!("{}", serde_json::to_string(payload)?);
+                    strip_extra(&mut payload);
+                    println!("{}", serde_json::to_string(&payload)?);
                     break;
                 }
             }
@@ -131,12 +138,24 @@ fn inject_extra(envelope: &Envelope, payload: &mut serde_json::Value) -> Option<
     if !matches!(envelope, Envelope::Tdlib) {
         return None;
     }
-    if payload.get("@extra").is_some() {
-        return payload["@extra"].as_str().map(|s| s.to_string());
+    let tdctl_id = format!("tdctl-{}", EXTRA_COUNTER.fetch_add(1, Ordering::Relaxed));
+    let mut extra_obj = serde_json::json!({ "tdctl": tdctl_id });
+    if let Some(user_extra) = payload.get("@extra") {
+        extra_obj["user"] = user_extra.clone();
     }
-    let extra = format!("tdctl-{}", EXTRA_COUNTER.fetch_add(1, Ordering::Relaxed));
-    payload["@extra"] = serde_json::Value::String(extra.clone());
-    Some(extra)
+    payload["@extra"] = extra_obj;
+    Some(tdctl_id)
+}
+
+fn strip_extra(payload: &mut serde_json::Value) {
+    let Some(extra) = payload.get("@extra") else {
+        return;
+    };
+    if let Some(user_extra) = extra.get("user") {
+        payload["@extra"] = user_extra.clone();
+    } else {
+        payload.as_object_mut().unwrap().remove("@extra");
+    }
 }
 
 fn wrap(envelope: &Envelope, payload: serde_json::Value) -> serde_json::Value {

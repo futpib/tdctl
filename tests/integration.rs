@@ -216,6 +216,7 @@ async fn test_tdlib_raw_envelope() {
 
     assert!(output.status.success());
     let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    // User's @extra should be preserved as-is
     assert_eq!(response, serde_json::json!({"@type": "getMe", "@extra": "1"}));
 }
 
@@ -230,9 +231,8 @@ async fn test_tdlib_raw_auto_extra() {
     assert!(output.status.success());
     let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(response["@type"], "getMe");
-    // Auto-injected @extra should be present
-    assert!(response.get("@extra").is_some());
-    assert!(response["@extra"].as_str().unwrap().starts_with("tdctl-"));
+    // No user-provided @extra, so it should be stripped from the response
+    assert!(response.get("@extra").is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
