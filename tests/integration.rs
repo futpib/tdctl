@@ -249,6 +249,50 @@ async fn test_tdesktop_raw_envelope() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_tdlib_raw_account_flag() {
+    // Server that copies the envelope's "account" field into the payload before echoing
+    let tempdir = TempDir::new().unwrap();
+    let socket_path = tempdir.path().join("test.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let (rd, mut wr) = stream.into_split();
+                let mut reader = BufReader::new(rd);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    let n = reader.read_line(&mut line).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    let mut envelope: serde_json::Value =
+                        serde_json::from_str(line.trim()).unwrap();
+                    let account = envelope["account"].clone();
+                    envelope["payload"]["account"] = account;
+                    let response = serde_json::to_string(&envelope).unwrap();
+                    wr.write_all(response.as_bytes()).await.unwrap();
+                    wr.write_all(b"\n").await.unwrap();
+                    wr.flush().await.unwrap();
+                }
+            });
+        }
+    });
+
+    let output = tdctl_cmd(&socket_path)
+        .args(["-a", "3", "tdesktop", "raw", r#"{"@type":"getMe"}"#])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["@type"], "getMe");
+    assert_eq!(response["account"], 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_raw_invalid_json_error() {
     let server = start_echo_server().await;
     let output = tdctl_cmd(&server.socket_path)

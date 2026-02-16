@@ -14,6 +14,10 @@ struct Cli {
     #[arg(long, global = true)]
     socket: Option<PathBuf>,
 
+    /// Account index
+    #[arg(short, long, global = true, default_value_t = 0)]
+    account: u32,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -158,11 +162,15 @@ fn strip_extra(payload: &mut serde_json::Value) {
     }
 }
 
-fn wrap(envelope: &Envelope, payload: serde_json::Value) -> serde_json::Value {
+fn wrap(envelope: &Envelope, account: u32, payload: serde_json::Value) -> serde_json::Value {
     match envelope {
         Envelope::None => payload,
-        Envelope::Tdlib => serde_json::json!({ "type": "tdlib", "payload": payload }),
-        Envelope::Tdesktop => serde_json::json!({ "type": "tdesktop", "payload": payload }),
+        Envelope::Tdlib => {
+            serde_json::json!({ "type": "tdlib", "account": account, "payload": payload })
+        }
+        Envelope::Tdesktop => {
+            serde_json::json!({ "type": "tdesktop", "account": account, "payload": payload })
+        }
     }
 }
 
@@ -170,6 +178,7 @@ fn wrap(envelope: &Envelope, payload: serde_json::Value) -> serde_json::Value {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let socket_path = cli.socket.unwrap_or_else(default_socket_path);
+    let account = cli.account;
 
     let (json_arg, envelope) = match cli.command {
         Command::Raw { json } => (json, Envelope::None),
@@ -190,7 +199,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(text) => {
             let mut payload = parse_json(&text)?;
             let extra = inject_extra(&envelope, &mut payload);
-            let message = wrap(&envelope, payload);
+            let message = wrap(&envelope, account, payload);
             send_and_receive(&mut reader, &mut writer, &message, &envelope, extra.as_deref())
                 .await?;
         }
@@ -204,7 +213,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let mut payload = parse_json(&line)?;
                 let extra = inject_extra(&envelope, &mut payload);
-                let message = wrap(&envelope, payload);
+                let message = wrap(&envelope, account, payload);
                 send_and_receive(&mut reader, &mut writer, &message, &envelope, extra.as_deref())
                     .await?;
             }
