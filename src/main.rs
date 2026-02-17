@@ -123,23 +123,32 @@ fn parse_json(text: &str) -> Result<serde_json::Value, Box<dyn std::error::Error
     Ok(value)
 }
 
+fn is_error_payload(payload: &serde_json::Value) -> bool {
+    payload.get("@type").and_then(|v| v.as_str()) == Some("error")
+}
+
+/// Returns true if the response was an error.
 async fn send_and_receive(
     reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
     writer: &mut BufWriter<tokio::net::unix::OwnedWriteHalf>,
     message: &serde_json::Value,
     envelope: &Envelope,
     expected_extra: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<bool, Box<dyn std::error::Error>> {
     let line = serde_json::to_string(message)?;
     writer.write_all(line.as_bytes()).await?;
     writer.write_all(b"\n").await?;
     writer.flush().await?;
 
-    match envelope {
+    let is_error = match envelope {
         Envelope::None => {
             let mut response = String::new();
             reader.read_line(&mut response).await?;
+            let is_err = serde_json::from_str::<serde_json::Value>(response.trim())
+                .map(|v| is_error_payload(&v))
+                .unwrap_or(false);
             print!("{response}");
+            is_err
         }
         Envelope::Tdesktop | Envelope::Mtp => {
             let mut response = String::new();
@@ -147,6 +156,7 @@ async fn send_and_receive(
             let parsed: serde_json::Value = serde_json::from_str(response.trim())?;
             let payload = &parsed["payload"];
             println!("{}", serde_json::to_string(payload)?);
+            is_error_payload(payload)
         }
         Envelope::Tdlib => loop {
             let mut response = String::new();
@@ -164,18 +174,20 @@ async fn send_and_receive(
                     == Some(extra);
                 if matches {
                     strip_extra(&mut payload);
+                    let is_err = is_error_payload(&payload);
                     println!("{}", serde_json::to_string(&payload)?);
-                    break;
+                    break is_err;
                 }
             } else {
                 strip_extra(&mut payload);
+                let is_err = is_error_payload(&payload);
                 println!("{}", serde_json::to_string(&payload)?);
-                break;
+                break is_err;
             }
         },
-    }
+    };
 
-    Ok(())
+    Ok(is_error)
 }
 
 enum Envelope {
@@ -508,12 +520,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    let mut had_error = false;
     match json_arg {
         Some(text) => {
             let mut payload = parse_json(&text)?;
             let extra = inject_extra(&envelope, &mut payload);
             let message = wrap(&envelope, account, payload);
-            send_and_receive(
+            had_error |= send_and_receive(
                 &mut reader,
                 &mut writer,
                 &message,
@@ -533,7 +546,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut payload = parse_json(&line)?;
                 let extra = inject_extra(&envelope, &mut payload);
                 let message = wrap(&envelope, account, payload);
-                send_and_receive(
+                had_error |= send_and_receive(
                     &mut reader,
                     &mut writer,
                     &message,
@@ -543,6 +556,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
             }
         }
+    }
+
+    if had_error {
+        std::process::exit(1);
     }
 
     Ok(())

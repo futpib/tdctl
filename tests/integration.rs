@@ -716,3 +716,51 @@ async fn test_mtp_raw_account_flag() {
     assert_eq!(response["@type"], "help.getNearestDc");
     assert_eq!(response["account"], 2);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_error_response_exit_code() {
+    let server = start_echo_server().await;
+    let output = tdctl_cmd(&server.socket_path)
+        .args([
+            "mtp",
+            "raw",
+            r#"{"@type":"error","code":400,"message":"INPUT_METHOD_INVALID"}"#,
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["@type"], "error");
+    assert_eq!(response["code"], 400);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_tdlib_error_response_exit_code() {
+    let server = start_echo_server().await;
+    let output = tdctl_cmd(&server.socket_path)
+        .args([
+            "tdlib",
+            "raw",
+            r#"{"@type":"error","code":400,"message":"Bad Request"}"#,
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["@type"], "error");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_raw_error_response_exit_code() {
+    let server = start_echo_server().await;
+    let output = tdctl_cmd(&server.socket_path)
+        .args(["raw", r#"{"@type":"error","code":400,"message":"test"}"#])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["@type"], "error");
+}
