@@ -764,3 +764,30 @@ async fn test_raw_error_response_exit_code() {
     let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(response["@type"], "error");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_mtp_raw_skips_unsolicited_updates() {
+    let server = start_noisy_echo_server().await;
+    let output = tdctl_cmd(&server.socket_path)
+        .args(["mtp", "raw", r#"{"@type":"help.getNearestDc"}"#])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    // Should get the mtp response, not a tdlib update
+    assert_eq!(response["@type"], "help.getNearestDc");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_tdesktop_raw_skips_unsolicited_updates() {
+    let server = start_noisy_echo_server().await;
+    let output = tdctl_cmd(&server.socket_path)
+        .args(["tdesktop", "raw", r#"{"command":"listAccounts"}"#])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["command"], "listAccounts");
+}

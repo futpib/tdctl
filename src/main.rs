@@ -151,12 +151,25 @@ async fn send_and_receive(
             is_err
         }
         Envelope::Tdesktop | Envelope::Mtp => {
-            let mut response = String::new();
-            reader.read_line(&mut response).await?;
-            let parsed: serde_json::Value = serde_json::from_str(response.trim())?;
-            let payload = &parsed["payload"];
-            println!("{}", serde_json::to_string(payload)?);
-            is_error_payload(payload)
+            let expected_type = match envelope {
+                Envelope::Tdesktop => "tdesktop",
+                Envelope::Mtp => "mtp",
+                _ => unreachable!(),
+            };
+            loop {
+                let mut response = String::new();
+                let n = reader.read_line(&mut response).await?;
+                if n == 0 {
+                    return Err("unexpected EOF while waiting for response".into());
+                }
+                let parsed: serde_json::Value = serde_json::from_str(response.trim())?;
+                if parsed.get("type").and_then(|v| v.as_str()) != Some(expected_type) {
+                    continue;
+                }
+                let payload = &parsed["payload"];
+                println!("{}", serde_json::to_string(payload)?);
+                break is_error_payload(payload);
+            }
         }
         Envelope::Tdlib => loop {
             let mut response = String::new();
