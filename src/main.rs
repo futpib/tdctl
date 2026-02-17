@@ -133,33 +133,31 @@ async fn send_and_receive(
             let payload = &parsed["payload"];
             println!("{}", serde_json::to_string(payload)?);
         }
-        Envelope::Tdlib => {
-            loop {
-                let mut response = String::new();
-                let n = reader.read_line(&mut response).await?;
-                if n == 0 {
-                    return Err("unexpected EOF while waiting for response".into());
-                }
-                let parsed: serde_json::Value = serde_json::from_str(response.trim())?;
-                let mut payload = parsed["payload"].clone();
-                if let Some(extra) = expected_extra {
-                    let matches = payload
-                        .get("@extra")
-                        .and_then(|v| v.get("tdctl"))
-                        .and_then(|v| v.as_str())
-                        == Some(extra);
-                    if matches {
-                        strip_extra(&mut payload);
-                        println!("{}", serde_json::to_string(&payload)?);
-                        break;
-                    }
-                } else {
+        Envelope::Tdlib => loop {
+            let mut response = String::new();
+            let n = reader.read_line(&mut response).await?;
+            if n == 0 {
+                return Err("unexpected EOF while waiting for response".into());
+            }
+            let parsed: serde_json::Value = serde_json::from_str(response.trim())?;
+            let mut payload = parsed["payload"].clone();
+            if let Some(extra) = expected_extra {
+                let matches = payload
+                    .get("@extra")
+                    .and_then(|v| v.get("tdctl"))
+                    .and_then(|v| v.as_str())
+                    == Some(extra);
+                if matches {
                     strip_extra(&mut payload);
                     println!("{}", serde_json::to_string(&payload)?);
                     break;
                 }
+            } else {
+                strip_extra(&mut payload);
+                println!("{}", serde_json::to_string(&payload)?);
+                break;
             }
-        }
+        },
     }
 
     Ok(())
@@ -226,12 +224,30 @@ fn format_export_progress(payload: &serde_json::Value) {
     let state = payload.get("state").and_then(|v| v.as_str()).unwrap_or("");
     match state {
         "processing" => {
-            let entity_index = payload.get("entity_index").and_then(|v| v.as_u64()).unwrap_or(0);
-            let entity_count = payload.get("entity_count").and_then(|v| v.as_u64()).unwrap_or(0);
-            let entity_name = payload.get("entity_name").and_then(|v| v.as_str()).unwrap_or("");
-            let entity_type = payload.get("entity_type").and_then(|v| v.as_str()).unwrap_or("");
-            let item_index = payload.get("item_index").and_then(|v| v.as_u64()).unwrap_or(0);
-            let item_count = payload.get("item_count").and_then(|v| v.as_u64()).unwrap_or(0);
+            let entity_index = payload
+                .get("entity_index")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let entity_count = payload
+                .get("entity_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let entity_name = payload
+                .get("entity_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let entity_type = payload
+                .get("entity_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let item_index = payload
+                .get("item_index")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let item_count = payload
+                .get("item_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
 
             let label = if !entity_name.is_empty() {
                 format!("{entity_type} \"{entity_name}\"")
@@ -239,11 +255,18 @@ fn format_export_progress(payload: &serde_json::Value) {
                 entity_type.to_string()
             };
 
-            let mut line = format!("[{entity_index}/{entity_count}] {label}: {item_index}/{item_count} items");
+            let mut line =
+                format!("[{entity_index}/{entity_count}] {label}: {item_index}/{item_count} items");
 
             if let Some(bytes_name) = payload.get("bytes_name").and_then(|v| v.as_str()) {
-                let bytes_loaded = payload.get("bytes_loaded").and_then(|v| v.as_u64()).unwrap_or(0);
-                let bytes_count = payload.get("bytes_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                let bytes_loaded = payload
+                    .get("bytes_loaded")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let bytes_count = payload
+                    .get("bytes_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
                 line.push_str(&format!(
                     " ({} {}/{})",
                     bytes_name,
@@ -256,8 +279,14 @@ fn format_export_progress(payload: &serde_json::Value) {
         }
         "finished" => {
             let path = payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            let files_count = payload.get("files_count").and_then(|v| v.as_u64()).unwrap_or(0);
-            let bytes_count = payload.get("bytes_count").and_then(|v| v.as_u64()).unwrap_or(0);
+            let files_count = payload
+                .get("files_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let bytes_count = payload
+                .get("bytes_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             eprintln!(
                 "Export finished: {} files, {} written to {}",
                 files_count,
@@ -266,7 +295,10 @@ fn format_export_progress(payload: &serde_json::Value) {
             );
         }
         "error" => {
-            let message = payload.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error");
+            let message = payload
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
             if let Some(path) = payload.get("path").and_then(|v| v.as_str()) {
                 eprintln!("Export error: {message} ({path})");
             } else {
@@ -459,8 +491,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut payload = parse_json(&text)?;
             let extra = inject_extra(&envelope, &mut payload);
             let message = wrap(&envelope, account, payload);
-            send_and_receive(&mut reader, &mut writer, &message, &envelope, extra.as_deref())
-                .await?;
+            send_and_receive(
+                &mut reader,
+                &mut writer,
+                &message,
+                &envelope,
+                extra.as_deref(),
+            )
+            .await?;
         }
         None => {
             use std::io::BufRead;
@@ -473,8 +511,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut payload = parse_json(&line)?;
                 let extra = inject_extra(&envelope, &mut payload);
                 let message = wrap(&envelope, account, payload);
-                send_and_receive(&mut reader, &mut writer, &message, &envelope, extra.as_deref())
-                    .await?;
+                send_and_receive(
+                    &mut reader,
+                    &mut writer,
+                    &message,
+                    &envelope,
+                    extra.as_deref(),
+                )
+                .await?;
             }
         }
     }

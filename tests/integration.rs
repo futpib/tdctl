@@ -4,7 +4,7 @@ use std::process::Command;
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 struct MockServer {
     socket_path: PathBuf,
@@ -150,7 +150,9 @@ async fn test_raw_multiple_json_stdin() {
     {
         use std::io::Write;
         let stdin = child.stdin.as_mut().unwrap();
-        stdin.write_all(b"{\"x\":1}\n{\"x\":2}\n{\"x\":3}\n").unwrap();
+        stdin
+            .write_all(b"{\"x\":1}\n{\"x\":2}\n{\"x\":3}\n")
+            .unwrap();
     }
     drop(child.stdin.take());
 
@@ -186,9 +188,7 @@ async fn test_raw_empty_lines_skipped() {
     {
         use std::io::Write;
         let stdin = child.stdin.as_mut().unwrap();
-        stdin
-            .write_all(b"\n{\"a\":1}\n\n\n{\"a\":2}\n\n")
-            .unwrap();
+        stdin.write_all(b"\n{\"a\":1}\n\n\n{\"a\":2}\n\n").unwrap();
     }
     drop(child.stdin.take());
 
@@ -218,7 +218,10 @@ async fn test_tdlib_raw_envelope() {
     assert!(output.status.success());
     let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     // User's @extra should be preserved as-is
-    assert_eq!(response, serde_json::json!({"@type": "getMe", "@extra": "1"}));
+    assert_eq!(
+        response,
+        serde_json::json!({"@type": "getMe", "@extra": "1"})
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -312,8 +315,7 @@ async fn test_tdesktop_list_accounts() {
                     if n == 0 {
                         break;
                     }
-                    let envelope: serde_json::Value =
-                        serde_json::from_str(line.trim()).unwrap();
+                    let envelope: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
                     let response = serde_json::json!({
                         "type": envelope["type"],
                         "payload": {
@@ -400,7 +402,10 @@ async fn start_export_server() -> MockServer {
                 }
 
                 let envelope: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
-                let account = envelope.get("account").and_then(|v| v.as_u64()).unwrap_or(0);
+                let account = envelope
+                    .get("account")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
 
                 // Send exportStarted
                 let started = serde_json::json!({
@@ -508,7 +513,10 @@ async fn start_slow_export_server() -> MockServer {
                 }
 
                 let envelope: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
-                let account = envelope.get("account").and_then(|v| v.as_u64()).unwrap_or(0);
+                let account = envelope
+                    .get("account")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
 
                 // Send exportStarted
                 let started = serde_json::json!({
