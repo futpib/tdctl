@@ -4,6 +4,7 @@ use std::process::Command;
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
+use tokio::time::{sleep, Duration};
 
 struct MockServer {
     socket_path: PathBuf,
@@ -376,4 +377,237 @@ async fn test_raw_empty_stdin_exits_cleanly() {
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
     assert!(output.stdout.is_empty());
+}
+
+async fn start_export_server() -> MockServer {
+    let tempdir = TempDir::new().unwrap();
+    let socket_path = tempdir.path().join("test.sock");
+
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let (rd, mut wr) = stream.into_split();
+                let mut reader = BufReader::new(rd);
+                let mut line = String::new();
+
+                // Read the export request
+                let n = reader.read_line(&mut line).await.unwrap();
+                if n == 0 {
+                    return;
+                }
+
+                let envelope: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                let account = envelope.get("account").and_then(|v| v.as_u64()).unwrap_or(0);
+
+                // Send exportStarted
+                let started = serde_json::json!({
+                    "type": "tdesktop",
+                    "payload": {"command": "exportStarted", "account": account}
+                });
+                wr.write_all(serde_json::to_string(&started).unwrap().as_bytes())
+                    .await
+                    .unwrap();
+                wr.write_all(b"\n").await.unwrap();
+                wr.flush().await.unwrap();
+
+                // Send progress updates
+                let updates = [
+                    serde_json::json!({
+                        "type": "tdesktop",
+                        "payload": {
+                            "command": "exportProgress", "account": account,
+                            "state": "processing", "step": "Dialogs",
+                            "entity_type": "Chat", "entity_name": "John Doe",
+                            "entity_index": 1, "entity_count": 3,
+                            "item_index": 50, "item_count": 100
+                        }
+                    }),
+                    serde_json::json!({
+                        "type": "tdesktop",
+                        "payload": {
+                            "command": "exportProgress", "account": account,
+                            "state": "processing", "step": "Dialogs",
+                            "entity_type": "Chat", "entity_name": "Photos",
+                            "entity_index": 2, "entity_count": 3,
+                            "item_index": 5, "item_count": 20,
+                            "bytes_loaded": 524288, "bytes_count": 2097152,
+                            "bytes_name": "photo.jpg"
+                        }
+                    }),
+                    serde_json::json!({
+                        "type": "tdesktop",
+                        "payload": {
+                            "command": "exportProgress", "account": account,
+                            "state": "finished",
+                            "path": "/tmp/export/test",
+                            "files_count": 42,
+                            "bytes_count": 52428800
+                        }
+                    }),
+                ];
+
+                for update in &updates {
+                    wr.write_all(serde_json::to_string(update).unwrap().as_bytes())
+                        .await
+                        .unwrap();
+                    wr.write_all(b"\n").await.unwrap();
+                    wr.flush().await.unwrap();
+                }
+            });
+        }
+    });
+
+    MockServer {
+        socket_path,
+        _tempdir: tempdir,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_export_progress() {
+    let server = start_export_server().await;
+    let output = tdctl_cmd(&server.socket_path)
+        .args(["export", "/tmp/test"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        output.status.success(),
+        "exit status: {:?}\nstderr: {stderr}\nstdout: {stdout}",
+        output.status
+    );
+    assert!(stderr.contains("Export started"));
+    assert!(stderr.contains("[1/3] Chat \"John Doe\": 50/100 items"));
+    assert!(stderr.contains("photo.jpg"));
+    assert!(stderr.contains("Export finished: 42 files"));
+}
+
+async fn start_slow_export_server() -> MockServer {
+    let tempdir = TempDir::new().unwrap();
+    let socket_path = tempdir.path().join("test.sock");
+
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let (rd, mut wr) = stream.into_split();
+                let mut reader = BufReader::new(rd);
+                let mut line = String::new();
+
+                // Read the export request
+                let n = reader.read_line(&mut line).await.unwrap();
+                if n == 0 {
+                    return;
+                }
+
+                let envelope: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                let account = envelope.get("account").and_then(|v| v.as_u64()).unwrap_or(0);
+
+                // Send exportStarted
+                let started = serde_json::json!({
+                    "type": "tdesktop",
+                    "payload": {"command": "exportStarted", "account": account}
+                });
+                wr.write_all(serde_json::to_string(&started).unwrap().as_bytes())
+                    .await
+                    .unwrap();
+                wr.write_all(b"\n").await.unwrap();
+                wr.flush().await.unwrap();
+
+                // Send slow progress updates
+                for i in 1..=20 {
+                    sleep(Duration::from_millis(50)).await;
+                    let update = serde_json::json!({
+                        "type": "tdesktop",
+                        "payload": {
+                            "command": "exportProgress", "account": account,
+                            "state": "processing", "step": "Dialogs",
+                            "entity_type": "Chat", "entity_name": "Test",
+                            "entity_index": 1, "entity_count": 1,
+                            "item_index": i, "item_count": 100
+                        }
+                    });
+                    if wr
+                        .write_all(serde_json::to_string(&update).unwrap().as_bytes())
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    if wr.write_all(b"\n").await.is_err() {
+                        return;
+                    }
+                    if wr.flush().await.is_err() {
+                        return;
+                    }
+                }
+
+                // Wait for cancelExport
+                line.clear();
+                let n = reader.read_line(&mut line).await.unwrap();
+                if n == 0 {
+                    return;
+                }
+
+                // Send cancelled
+                let cancelled = serde_json::json!({
+                    "type": "tdesktop",
+                    "payload": {
+                        "command": "exportProgress", "account": account,
+                        "state": "cancelled"
+                    }
+                });
+                wr.write_all(serde_json::to_string(&cancelled).unwrap().as_bytes())
+                    .await
+                    .unwrap();
+                wr.write_all(b"\n").await.unwrap();
+                wr.flush().await.unwrap();
+            });
+        }
+    });
+
+    MockServer {
+        socket_path,
+        _tempdir: tempdir,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_export_cancel() {
+    let server = start_slow_export_server().await;
+    let child = Command::new(env!("CARGO_BIN_EXE_tdctl"))
+        .arg("--socket")
+        .arg(&server.socket_path)
+        .args(["export", "/tmp/test"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let pid = child.id() as i32;
+
+    // Wait a bit for some progress, then send SIGINT
+    sleep(Duration::from_millis(200)).await;
+    unsafe {
+        libc::kill(pid, libc::SIGINT);
+    }
+
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        output.status.success(),
+        "exit status: {:?}\nstderr: {stderr}\nstdout: {stdout}",
+        output.status
+    );
+    assert!(stderr.contains("Export started"));
+    assert!(stderr.contains("Cancelling export"));
+    assert!(stderr.contains("Export cancelled"));
 }
