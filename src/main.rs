@@ -42,6 +42,12 @@ enum Command {
         command: TdesktopCommand,
     },
 
+    /// MTP (raw Telegram API) commands
+    Mtp {
+        #[command(subcommand)]
+        command: MtpCommand,
+    },
+
     /// List available accounts
     ListAccounts,
 
@@ -94,6 +100,15 @@ enum TdesktopCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum MtpCommand {
+    /// Send raw JSON wrapped in an mtp envelope
+    Raw {
+        /// JSON to send as payload (reads from stdin if omitted)
+        json: Option<String>,
+    },
+}
+
 fn default_socket_path() -> PathBuf {
     if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
         return PathBuf::from(dir).join("tdesktop.sock");
@@ -126,7 +141,7 @@ async fn send_and_receive(
             reader.read_line(&mut response).await?;
             print!("{response}");
         }
-        Envelope::Tdesktop => {
+        Envelope::Tdesktop | Envelope::Mtp => {
             let mut response = String::new();
             reader.read_line(&mut response).await?;
             let parsed: serde_json::Value = serde_json::from_str(response.trim())?;
@@ -167,6 +182,7 @@ enum Envelope {
     None,
     Tdlib,
     Tdesktop,
+    Mtp,
 }
 
 fn inject_extra(envelope: &Envelope, payload: &mut serde_json::Value) -> Option<String> {
@@ -201,6 +217,9 @@ fn wrap(envelope: &Envelope, account: u32, payload: serde_json::Value) -> serde_
         }
         Envelope::Tdesktop => {
             serde_json::json!({ "type": "tdesktop", "account": account, "payload": payload })
+        }
+        Envelope::Mtp => {
+            serde_json::json!({ "type": "mtp", "account": account, "payload": payload })
         }
     }
 }
@@ -325,6 +344,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         Command::Tdesktop { command } => match command {
             TdesktopCommand::Raw { json } => (json.clone(), Envelope::Tdesktop),
+        },
+        Command::Mtp { command } => match command {
+            MtpCommand::Raw { json } => (json.clone(), Envelope::Mtp),
         },
         Command::ListAccounts => (None, Envelope::Tdesktop),
         Command::Export { .. } => (None, Envelope::Tdesktop),

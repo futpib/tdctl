@@ -619,3 +619,100 @@ async fn test_export_cancel() {
     assert!(stderr.contains("Cancelling export"));
     assert!(stderr.contains("Export cancelled"));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_mtp_raw_envelope() {
+    let server = start_echo_server().await;
+    let output = tdctl_cmd(&server.socket_path)
+        .args(["mtp", "raw", r#"{"@type":"help.getNearestDc"}"#])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response, serde_json::json!({"@type": "help.getNearestDc"}));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_mtp_raw_stdin() {
+    let server = start_echo_server().await;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tdctl"))
+        .arg("--socket")
+        .arg(&server.socket_path)
+        .args(["mtp", "raw"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    {
+        use std::io::Write;
+        let stdin = child.stdin.as_mut().unwrap();
+        stdin
+            .write_all(b"{\"@type\":\"help.getNearestDc\"}\n{\"@type\":\"help.getConfig\"}\n")
+            .unwrap();
+    }
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+
+    let responses: Vec<serde_json::Value> = output
+        .stdout
+        .split(|&b| b == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+
+    assert_eq!(responses.len(), 2);
+    assert_eq!(
+        responses[0],
+        serde_json::json!({"@type": "help.getNearestDc"})
+    );
+    assert_eq!(responses[1], serde_json::json!({"@type": "help.getConfig"}));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_mtp_raw_account_flag() {
+    // Server that copies the envelope's "account" field into the payload before echoing
+    let tempdir = TempDir::new().unwrap();
+    let socket_path = tempdir.path().join("test.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let (rd, mut wr) = stream.into_split();
+                let mut reader = BufReader::new(rd);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    let n = reader.read_line(&mut line).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    let mut envelope: serde_json::Value =
+                        serde_json::from_str(line.trim()).unwrap();
+                    let account = envelope["account"].clone();
+                    envelope["payload"]["account"] = account;
+                    let response = serde_json::to_string(&envelope).unwrap();
+                    wr.write_all(response.as_bytes()).await.unwrap();
+                    wr.write_all(b"\n").await.unwrap();
+                    wr.flush().await.unwrap();
+                }
+            });
+        }
+    });
+
+    let output = tdctl_cmd(&socket_path)
+        .args(["-a", "2", "mtp", "raw", r#"{"@type":"help.getNearestDc"}"#])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["@type"], "help.getNearestDc");
+    assert_eq!(response["account"], 2);
+}
