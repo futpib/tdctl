@@ -15,8 +15,8 @@ struct Cli {
     socket: Option<PathBuf>,
 
     /// Account index
-    #[arg(short, long, global = true, default_value_t = 0)]
-    account: u32,
+    #[arg(short, long, global = true)]
+    account: Option<u32>,
 
     #[command(subcommand)]
     command: Command,
@@ -234,17 +234,25 @@ fn strip_extra(payload: &mut serde_json::Value) {
     }
 }
 
-fn wrap(envelope: &Envelope, account: u32, payload: serde_json::Value) -> serde_json::Value {
+fn wrap(
+    envelope: &Envelope,
+    account: Option<u32>,
+    payload: serde_json::Value,
+) -> serde_json::Value {
     match envelope {
         Envelope::None => payload,
-        Envelope::Tdlib => {
-            serde_json::json!({ "type": "tdlib", "account": account, "payload": payload })
-        }
-        Envelope::Tdesktop => {
-            serde_json::json!({ "type": "tdesktop", "account": account, "payload": payload })
-        }
-        Envelope::Mtp => {
-            serde_json::json!({ "type": "mtp", "account": account, "payload": payload })
+        Envelope::Tdlib | Envelope::Tdesktop | Envelope::Mtp => {
+            let type_str = match envelope {
+                Envelope::Tdlib => "tdlib",
+                Envelope::Tdesktop => "tdesktop",
+                Envelope::Mtp => "mtp",
+                _ => unreachable!(),
+            };
+            let mut msg = serde_json::json!({ "type": type_str, "payload": payload });
+            if let Some(account) = account {
+                msg["account"] = serde_json::json!(account);
+            }
+            msg
         }
     }
 }

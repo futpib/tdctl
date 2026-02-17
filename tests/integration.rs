@@ -791,3 +791,77 @@ async fn test_tdesktop_raw_skips_unsolicited_updates() {
     let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(response["command"], "listAccounts");
 }
+
+/// A mock server that echoes the raw envelope JSON (not just the payload).
+async fn start_envelope_echo_server() -> MockServer {
+    let tempdir = TempDir::new().unwrap();
+    let socket_path = tempdir.path().join("test.sock");
+
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let (rd, mut wr) = stream.into_split();
+                let mut reader = BufReader::new(rd);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    let n = reader.read_line(&mut line).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    // Parse envelope, copy "account" (or lack thereof) into payload, echo back
+                    let mut envelope: serde_json::Value =
+                        serde_json::from_str(line.trim()).unwrap();
+                    let has_account = envelope.get("account").is_some();
+                    envelope["payload"]["has_account"] = serde_json::json!(has_account);
+                    if has_account {
+                        let account = envelope["account"].clone();
+                        envelope["payload"]["account"] = account;
+                    }
+                    let response = serde_json::to_string(&envelope).unwrap();
+                    wr.write_all(response.as_bytes()).await.unwrap();
+                    wr.write_all(b"\n").await.unwrap();
+                    wr.flush().await.unwrap();
+                }
+            });
+        }
+    });
+
+    MockServer {
+        socket_path,
+        _tempdir: tempdir,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_account_omitted_by_default() {
+    let server = start_envelope_echo_server().await;
+    let output = tdctl_cmd(&server.socket_path)
+        .args(["mtp", "raw", r#"{"@type":"help.getNearestDc"}"#])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["@type"], "help.getNearestDc");
+    assert_eq!(response["has_account"], false);
+    assert!(response.get("account").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_account_included_when_specified() {
+    let server = start_envelope_echo_server().await;
+    let output = tdctl_cmd(&server.socket_path)
+        .args(["-a", "2", "mtp", "raw", r#"{"@type":"help.getNearestDc"}"#])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["@type"], "help.getNearestDc");
+    assert_eq!(response["has_account"], true);
+    assert_eq!(response["account"], 2);
+}
