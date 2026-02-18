@@ -865,3 +865,266 @@ async fn test_account_included_when_specified() {
     assert_eq!(response["has_account"], true);
     assert_eq!(response["account"], 2);
 }
+
+/// A mock TDLib server that handles searchPublicChat and getChatHistory requests.
+/// Returns fake messages for getChatHistory, with pagination support.
+async fn start_tdlib_chat_server() -> MockServer {
+    let tempdir = TempDir::new().unwrap();
+    let socket_path = tempdir.path().join("test.sock");
+
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let (rd, mut wr) = stream.into_split();
+                let mut reader = BufReader::new(rd);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    let n = reader.read_line(&mut line).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    let envelope: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                    let payload = &envelope["payload"];
+                    let extra = payload.get("@extra").cloned();
+                    let req_type = payload.get("@type").and_then(|v| v.as_str()).unwrap_or("");
+
+                    let response_payload = match req_type {
+                        "searchPublicChat" => {
+                            let mut resp = serde_json::json!({
+                                "@type": "chat",
+                                "id": -1001234567890_i64,
+                                "title": "Test Channel",
+                            });
+                            if let Some(e) = &extra {
+                                resp["@extra"] = e.clone();
+                            }
+                            resp
+                        }
+                        "getChatHistory" => {
+                            let from_id = payload
+                                .get("from_message_id")
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(0);
+
+                            // Generate messages: IDs 5,4,3,2,1
+                            // from_id=0 means start from latest (return 5,4,3)
+                            // from_id=3 means return 2,1
+                            // from_id=1 means return empty (exhausted)
+                            let all_messages: Vec<serde_json::Value> = (1..=5)
+                                .rev()
+                                .map(|i| {
+                                    serde_json::json!({
+                                        "@type": "message",
+                                        "id": i,
+                                        "chat_id": -1001234567890_i64,
+                                        "date": 1708185600 + i * 60,
+                                        "author_signature": "Pavel Durov",
+                                        "content": {
+                                            "@type": "messageText",
+                                            "text": {
+                                                "@type": "formattedText",
+                                                "text": format!("Message {i}"),
+                                            }
+                                        },
+                                        "interaction_info": {
+                                            "view_count": i * 1000,
+                                        }
+                                    })
+                                })
+                                .collect();
+
+                            let messages: Vec<serde_json::Value> = if from_id == 0 {
+                                // First batch: return first 3 (IDs 5,4,3)
+                                all_messages.into_iter().take(3).collect()
+                            } else {
+                                // Return messages with ID < from_id
+                                all_messages
+                                    .into_iter()
+                                    .filter(|m| {
+                                        m.get("id").and_then(|v| v.as_i64()).unwrap_or(0) < from_id
+                                    })
+                                    .collect()
+                            };
+
+                            let mut resp = serde_json::json!({
+                                "@type": "messages",
+                                "total_count": messages.len(),
+                                "messages": messages,
+                            });
+                            if let Some(e) = &extra {
+                                resp["@extra"] = e.clone();
+                            }
+                            resp
+                        }
+                        _ => {
+                            let mut resp = serde_json::json!({
+                                "@type": "error",
+                                "code": 404,
+                                "message": "Not Found",
+                            });
+                            if let Some(e) = &extra {
+                                resp["@extra"] = e.clone();
+                            }
+                            resp
+                        }
+                    };
+
+                    let response = serde_json::json!({
+                        "type": "tdlib",
+                        "payload": response_payload,
+                    });
+                    let response_str = serde_json::to_string(&response).unwrap();
+                    wr.write_all(response_str.as_bytes()).await.unwrap();
+                    wr.write_all(b"\n").await.unwrap();
+                    wr.flush().await.unwrap();
+                }
+            });
+        }
+    });
+
+    MockServer {
+        socket_path,
+        _tempdir: tempdir,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_get_history_json() {
+    let server = start_tdlib_chat_server().await;
+    let output = tdctl_cmd(&server.socket_path)
+        .args(["get-history", "-1001234567890", "--json"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "exit status: {:?}\nstderr: {stderr}\nstdout: {stdout}",
+        output.status
+    );
+
+    let messages: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+
+    assert_eq!(messages.len(), 5);
+    assert_eq!(messages[0]["id"], 5);
+    assert_eq!(messages[4]["id"], 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_get_history_human() {
+    let server = start_tdlib_chat_server().await;
+    let output = tdctl_cmd(&server.socket_path)
+        .args(["get-history", "-1001234567890"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "exit status: {:?}\nstderr: {stderr}\nstdout: {stdout}",
+        output.status
+    );
+
+    assert!(stdout.contains("#5"), "should contain message ID #5");
+    assert!(stdout.contains("#1"), "should contain message ID #1");
+    assert!(stdout.contains("Pavel Durov"), "should contain author");
+    assert!(stdout.contains("Message 5"), "should contain message text");
+    assert!(stdout.contains("views"), "should contain view count");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_get_history_limit() {
+    let server = start_tdlib_chat_server().await;
+    let output = tdctl_cmd(&server.socket_path)
+        .args(["get-history", "-1001234567890", "--json", "--limit", "2"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "exit status: {:?}\nstderr: {stderr}\nstdout: {stdout}",
+        output.status
+    );
+
+    let messages: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0]["id"], 5);
+    assert_eq!(messages[1]["id"], 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_get_history_username() {
+    let server = start_tdlib_chat_server().await;
+    let output = tdctl_cmd(&server.socket_path)
+        .args(["get-history", "@testchannel", "--json", "--limit", "1"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "exit status: {:?}\nstderr: {stderr}\nstdout: {stdout}",
+        output.status
+    );
+
+    let messages: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+
+    assert_eq!(messages.len(), 1);
+    // Chat ID should be from the resolved searchPublicChat
+    assert_eq!(messages[0]["chat_id"], -1001234567890_i64);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_get_history_pagination() {
+    let server = start_tdlib_chat_server().await;
+    let output = tdctl_cmd(&server.socket_path)
+        .args(["get-history", "-1001234567890", "--json"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "exit status: {:?}\nstderr: {stderr}\nstdout: {stdout}",
+        output.status
+    );
+
+    let messages: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+
+    // Server returns 3 in first batch (5,4,3), then 2 in second batch (2,1)
+    assert_eq!(
+        messages.len(),
+        5,
+        "should fetch all 5 messages across 2 batches"
+    );
+    // Verify ordering: newest first
+    let ids: Vec<i64> = messages.iter().map(|m| m["id"].as_i64().unwrap()).collect();
+    assert_eq!(ids, vec![5, 4, 3, 2, 1]);
+}
