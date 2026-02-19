@@ -513,6 +513,175 @@ const ANSI_DIM: &str = "\x1b[2m";
 const ANSI_BOLD_YELLOW: &str = "\x1b[1;33m";
 const ANSI_BOLD_MAGENTA: &str = "\x1b[1;35m";
 
+fn entity_type_ansi(entity_type: &serde_json::Value) -> Option<&'static str> {
+    let type_str = entity_type.get("@type").and_then(|v| v.as_str())?;
+    match type_str {
+        "textEntityTypeBold" => Some("\x1b[1m"),
+        "textEntityTypeItalic" => Some("\x1b[3m"),
+        "textEntityTypeUnderline" => Some("\x1b[4m"),
+        "textEntityTypeStrikethrough" => Some("\x1b[9m"),
+        "textEntityTypeCode" | "textEntityTypePre" | "textEntityTypePreCode" => Some("\x1b[7m"),
+        "textEntityTypeUrl" => Some("\x1b[4m"),
+        "textEntityTypeSpoiler" => Some("\x1b[8m"),
+        "textEntityTypeBlockQuote" | "textEntityTypeExpandableBlockQuote" => Some("\x1b[2m"),
+        _ => None,
+    }
+}
+
+fn entity_type_markdown(entity_type: &serde_json::Value) -> Option<&'static str> {
+    let type_str = entity_type.get("@type").and_then(|v| v.as_str())?;
+    match type_str {
+        "textEntityTypeBold" => Some("**"),
+        "textEntityTypeItalic" => Some("_"),
+        "textEntityTypeStrikethrough" => Some("~~"),
+        "textEntityTypeCode" => Some("`"),
+        "textEntityTypePre" | "textEntityTypePreCode" => Some("```"),
+        "textEntityTypeSpoiler" => Some("||"),
+        _ => None,
+    }
+}
+
+fn format_formatted_text(formatted_text: &serde_json::Value, color: bool) -> String {
+    let text = formatted_text
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let entities = formatted_text.get("entities").and_then(|v| v.as_array());
+    let entities = match entities {
+        Some(e) if !e.is_empty() => e,
+        _ => return text.to_string(),
+    };
+
+    // Build UTF-16 offset to byte offset mapping
+    let mut utf16_to_byte: Vec<usize> = Vec::new();
+    let mut byte_pos = 0;
+    for ch in text.chars() {
+        let utf16_len = ch.len_utf16();
+        for _ in 0..utf16_len {
+            utf16_to_byte.push(byte_pos);
+        }
+        byte_pos += ch.len_utf8();
+    }
+    utf16_to_byte.push(byte_pos); // sentinel for end-of-string
+
+    struct Event {
+        byte_pos: usize,
+        is_end: bool,
+        entity_idx: usize,
+        ansi_code: &'static str,
+        md_marker: &'static str,
+        text_url: Option<String>,
+    }
+
+    let mut events: Vec<Event> = Vec::new();
+    for (i, entity) in entities.iter().enumerate() {
+        let offset = entity.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let length = entity.get("length").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let etype = entity.get("type").unwrap_or(&serde_json::Value::Null);
+
+        let ansi_code = entity_type_ansi(etype).unwrap_or("");
+        let md_marker = entity_type_markdown(etype).unwrap_or("");
+
+        let text_url =
+            if etype.get("@type").and_then(|v| v.as_str()) == Some("textEntityTypeTextUrl") {
+                etype
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            } else {
+                None
+            };
+
+        let start = if offset < utf16_to_byte.len() {
+            utf16_to_byte[offset]
+        } else {
+            byte_pos
+        };
+        let end_utf16 = offset + length;
+        let end = if end_utf16 < utf16_to_byte.len() {
+            utf16_to_byte[end_utf16]
+        } else {
+            byte_pos
+        };
+
+        events.push(Event {
+            byte_pos: start,
+            is_end: false,
+            entity_idx: i,
+            ansi_code,
+            md_marker,
+            text_url: text_url.clone(),
+        });
+        events.push(Event {
+            byte_pos: end,
+            is_end: true,
+            entity_idx: i,
+            ansi_code,
+            md_marker,
+            text_url,
+        });
+    }
+
+    // Sort: by byte_pos, then ends before starts (so closing happens before opening at same position)
+    events.sort_by(|a, b| {
+        a.byte_pos
+            .cmp(&b.byte_pos)
+            .then_with(|| a.is_end.cmp(&b.is_end).reverse())
+    });
+
+    let mut result = String::new();
+    let mut prev = 0;
+
+    if color {
+        let mut active: Vec<(usize, &str)> = Vec::new();
+        for event in &events {
+            if event.byte_pos > prev {
+                result.push_str(&text[prev..event.byte_pos]);
+            }
+            prev = event.byte_pos;
+
+            if event.is_end {
+                if let Some(url) = &event.text_url {
+                    result.push_str(&format!(" ({})", url));
+                }
+                active.retain(|(idx, _)| *idx != event.entity_idx);
+                result.push_str(ANSI_RESET);
+                for (_, code) in &active {
+                    result.push_str(code);
+                }
+            } else if !event.ansi_code.is_empty() {
+                result.push_str(event.ansi_code);
+                active.push((event.entity_idx, event.ansi_code));
+            }
+        }
+    } else {
+        for event in &events {
+            if event.byte_pos > prev {
+                result.push_str(&text[prev..event.byte_pos]);
+            }
+            prev = event.byte_pos;
+
+            if event.is_end {
+                if let Some(url) = &event.text_url {
+                    result.push_str(&format!("]({})", url));
+                } else {
+                    result.push_str(event.md_marker);
+                }
+            } else if event.text_url.is_some() {
+                result.push('[');
+            } else {
+                result.push_str(event.md_marker);
+            }
+        }
+    }
+
+    if prev < text.len() {
+        result.push_str(&text[prev..]);
+    }
+
+    result
+}
+
 fn format_message_human(
     message: &serde_json::Value,
     sender_name: Option<&str>,
@@ -762,7 +931,7 @@ fn format_album_human(messages: &[ResolvedMessage], color: bool) -> String {
 
     let caption = messages
         .iter()
-        .map(|m| get_caption_from_message(&m.msg))
+        .map(|m| get_caption_from_message(&m.msg, color))
         .find(|c| !c.is_empty())
         .unwrap_or_default();
 
@@ -773,13 +942,12 @@ fn format_album_human(messages: &[ResolvedMessage], color: bool) -> String {
     }
 }
 
-fn get_caption_from_message(msg: &serde_json::Value) -> String {
-    msg.get("content")
+fn get_caption_from_message(msg: &serde_json::Value, color: bool) -> String {
+    let ft = msg
+        .get("content")
         .and_then(|c| c.get("caption"))
-        .and_then(|v| v.get("text"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string()
+        .unwrap_or(&serde_json::Value::Null);
+    format_formatted_text(ft, color)
 }
 
 fn format_view_count(count: i64) -> String {
@@ -814,14 +982,12 @@ fn format_message_content(
     let id = format!("#{message_id}");
 
     match content_type {
-        "messageText" => content
-            .get("text")
-            .and_then(|v| v.get("text"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
+        "messageText" => {
+            let ft = content.get("text").unwrap_or(&serde_json::Value::Null);
+            format_formatted_text(ft, color)
+        }
         "messagePhoto" => {
-            let caption = get_caption(content);
+            let caption = format_caption(content, color);
             let tag = color_tag(&format!("[Photo {id}]"));
             if caption.is_empty() {
                 tag
@@ -851,7 +1017,7 @@ fn format_message_content(
             } else {
                 color_tag(&format!("[Video {id}]"))
             };
-            let caption = get_caption(content);
+            let caption = format_caption(content, color);
             if caption.is_empty() {
                 tag
             } else {
@@ -880,7 +1046,7 @@ fn format_message_content(
             } else {
                 color_tag(&format!("[Document {id}]"))
             };
-            let caption = get_caption(content);
+            let caption = format_caption(content, color);
             if caption.is_empty() {
                 tag
             } else {
@@ -898,7 +1064,7 @@ fn format_message_content(
             } else {
                 color_tag(&format!("[Audio {id}]"))
             };
-            let caption = get_caption(content);
+            let caption = format_caption(content, color);
             if caption.is_empty() {
                 tag
             } else {
@@ -906,7 +1072,7 @@ fn format_message_content(
             }
         }
         "messageAnimation" => {
-            let caption = get_caption(content);
+            let caption = format_caption(content, color);
             let tag = color_tag(&format!("[GIF {id}]"));
             if caption.is_empty() {
                 tag
@@ -915,7 +1081,7 @@ fn format_message_content(
             }
         }
         "messageVoiceNote" => {
-            let caption = get_caption(content);
+            let caption = format_caption(content, color);
             let tag = color_tag(&format!("[Voice note {id}]"));
             if caption.is_empty() {
                 tag
@@ -953,13 +1119,9 @@ fn format_message_content(
     }
 }
 
-fn get_caption(content: &serde_json::Value) -> String {
-    content
-        .get("caption")
-        .and_then(|v| v.get("text"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string()
+fn format_caption(content: &serde_json::Value, color: bool) -> String {
+    let ft = content.get("caption").unwrap_or(&serde_json::Value::Null);
+    format_formatted_text(ft, color)
 }
 
 fn format_bytes(bytes: u64) -> String {
