@@ -153,6 +153,15 @@ fn is_error_payload(payload: &serde_json::Value) -> bool {
     payload.get("@type").and_then(|v| v.as_str()) == Some("error")
 }
 
+fn parse_flood_wait(payload: &serde_json::Value) -> Option<u64> {
+    if !is_error_payload(payload) {
+        return None;
+    }
+    let message = payload.get("message").and_then(|v| v.as_str())?;
+    let seconds = message.strip_prefix("FLOOD_WAIT_")?;
+    seconds.parse().ok()
+}
+
 async fn send_and_receive(
     reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
     writer: &mut BufWriter<tokio::net::unix::OwnedWriteHalf>,
@@ -306,6 +315,23 @@ async fn send_tdlib_request(
     }
 }
 
+async fn send_tdlib_request_with_retry(
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    writer: &mut BufWriter<tokio::net::unix::OwnedWriteHalf>,
+    account: Option<u32>,
+    payload: serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    loop {
+        let response = send_tdlib_request(reader, writer, account, payload.clone()).await?;
+        if let Some(seconds) = parse_flood_wait(&response) {
+            eprintln!("Rate limited, waiting {seconds}s...");
+            tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+            continue;
+        }
+        return Ok(response);
+    }
+}
+
 async fn resolve_chat(
     reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
     writer: &mut BufWriter<tokio::net::unix::OwnedWriteHalf>,
@@ -321,7 +347,7 @@ async fn resolve_chat(
         "@type": "searchPublicChat",
         "username": username,
     });
-    let response = send_tdlib_request(reader, writer, account, payload).await?;
+    let response = send_tdlib_request_with_retry(reader, writer, account, payload).await?;
     if is_error_payload(&response) {
         let message = response
             .get("message")
@@ -376,7 +402,7 @@ impl NameCache {
             "@type": "getUser",
             "user_id": user_id,
         });
-        let name = match send_tdlib_request(reader, writer, account, payload).await {
+        let name = match send_tdlib_request_with_retry(reader, writer, account, payload).await {
             Ok(response) if !is_error_payload(&response) => {
                 let first = response
                     .get("first_name")
@@ -414,7 +440,7 @@ impl NameCache {
             "@type": "getChat",
             "chat_id": chat_id,
         });
-        let name = match send_tdlib_request(reader, writer, account, payload).await {
+        let name = match send_tdlib_request_with_retry(reader, writer, account, payload).await {
             Ok(response) if !is_error_payload(&response) => {
                 let title = response.get("title").and_then(|v| v.as_str()).unwrap_or("");
                 format_display_name(chat_id, None, title)
@@ -1260,7 +1286,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "limit": batch_limit,
                     "only_local": false,
                 });
-                let response = send_tdlib_request(&mut reader, &mut writer, account, payload).await;
+                let response =
+                    send_tdlib_request_with_retry(&mut reader, &mut writer, account, payload).await;
                 let response = match response {
                     Ok(r) => r,
                     Err(e) => {
