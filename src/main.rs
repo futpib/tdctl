@@ -416,10 +416,7 @@ impl NameCache {
         });
         let name = match send_tdlib_request(reader, writer, account, payload).await {
             Ok(response) if !is_error_payload(&response) => {
-                let title = response
-                    .get("title")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let title = response.get("title").and_then(|v| v.as_str()).unwrap_or("");
                 format_display_name(chat_id, None, title)
             }
             _ => format!("#{chat_id}"),
@@ -584,12 +581,175 @@ fn format_message_human(
         }
     }
 
-    let content = format_message_content(message.get("content"), color);
+    let content = format_message_content(id, message.get("content"), color);
     if content.is_empty() {
         header
     } else {
         format!("{}\n{}", header, content)
     }
+}
+
+struct ResolvedMessage {
+    msg: serde_json::Value,
+    sender_name: Option<String>,
+    forward_origin_name: Option<String>,
+}
+
+fn get_media_album_id(msg: &serde_json::Value) -> i64 {
+    msg.get("media_album_id")
+        .and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
+        .unwrap_or(0)
+}
+
+fn content_type_label(content: Option<&serde_json::Value>) -> &'static str {
+    let Some(content) = content else {
+        return "Unknown";
+    };
+    match content.get("@type").and_then(|v| v.as_str()).unwrap_or("") {
+        "messagePhoto" => "Photo",
+        "messageVideo" => "Video",
+        "messageDocument" => "Document",
+        "messageAudio" => "Audio",
+        _ => "Media",
+    }
+}
+
+fn format_album_human(messages: &[ResolvedMessage], color: bool) -> String {
+    let first = &messages[0];
+
+    let mut parts = Vec::new();
+    let mut plain_parts = Vec::new();
+
+    let id = first
+        .msg
+        .get("id")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let id_str = format!("#{id}");
+    plain_parts.push(id_str.clone());
+    if color {
+        parts.push(format!("{ANSI_BOLD_CYAN}{id_str}{ANSI_RESET}"));
+    } else {
+        parts.push(id_str);
+    }
+
+    if let Some(date) = first.msg.get("date").and_then(|v| v.as_i64()) {
+        let dt = Local
+            .timestamp_opt(date, 0)
+            .single()
+            .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_default();
+        plain_parts.push(dt.clone());
+        if color {
+            parts.push(format!("{ANSI_DIM}{dt}{ANSI_RESET}"));
+        } else {
+            parts.push(dt);
+        }
+    }
+
+    let author = first
+        .sender_name
+        .as_deref()
+        .or_else(|| {
+            first
+                .msg
+                .get("author_signature")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or("");
+    if !author.is_empty() {
+        plain_parts.push(author.to_string());
+        if color {
+            parts.push(format!("{ANSI_BOLD_YELLOW}{author}{ANSI_RESET}"));
+        } else {
+            parts.push(author.to_string());
+        }
+    }
+
+    let forwarded = first.msg.get("forward_info").is_some() && !first.msg["forward_info"].is_null();
+    if forwarded {
+        let fwd_label = match &first.forward_origin_name {
+            Some(name) => format!("forwarded from {name}"),
+            None => "forwarded".to_string(),
+        };
+        plain_parts.push(fwd_label.clone());
+        if color {
+            parts.push(format!("{ANSI_DIM}{fwd_label}{ANSI_RESET}"));
+        } else {
+            parts.push(fwd_label);
+        }
+    }
+
+    let view_count = messages
+        .iter()
+        .map(|m| {
+            m.msg
+                .get("interaction_info")
+                .and_then(|v| v.get("view_count"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+        })
+        .max()
+        .unwrap_or(0);
+
+    let mut header = parts.join("  ");
+    if view_count > 0 {
+        let formatted_views = format_view_count(view_count);
+        let visual_len = plain_parts.join("  ").len();
+        let padding = if visual_len < 60 {
+            " ".repeat(60 - visual_len)
+        } else {
+            "  ".to_string()
+        };
+        if color {
+            header.push_str(&format!(
+                "{}{ANSI_DIM}{} views{ANSI_RESET}",
+                padding, formatted_views
+            ));
+        } else {
+            header.push_str(&format!("{}{} views", padding, formatted_views));
+        }
+    }
+
+    let items: Vec<String> = messages
+        .iter()
+        .map(|m| {
+            let id = m.msg.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+            let label = content_type_label(m.msg.get("content"));
+            format!("{label} #{id}")
+        })
+        .collect();
+    let album_tag = format!("[{}]", items.join(", "));
+    let album_tag = if color {
+        format!("{ANSI_BOLD_MAGENTA}{album_tag}{ANSI_RESET}")
+    } else {
+        album_tag
+    };
+
+    let caption = messages
+        .iter()
+        .map(|m| get_caption_from_message(&m.msg))
+        .find(|c| !c.is_empty())
+        .unwrap_or_default();
+
+    if caption.is_empty() {
+        format!("{header}\n{album_tag}")
+    } else {
+        format!("{header}\n{album_tag}\n{caption}")
+    }
+}
+
+fn get_caption_from_message(msg: &serde_json::Value) -> String {
+    msg.get("content")
+        .and_then(|c| c.get("caption"))
+        .and_then(|v| v.get("text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 fn format_view_count(count: i64) -> String {
@@ -602,7 +762,11 @@ fn format_view_count(count: i64) -> String {
     }
 }
 
-fn format_message_content(content: Option<&serde_json::Value>, color: bool) -> String {
+fn format_message_content(
+    message_id: i64,
+    content: Option<&serde_json::Value>,
+    color: bool,
+) -> String {
     let Some(content) = content else {
         return String::new();
     };
@@ -617,6 +781,8 @@ fn format_message_content(content: Option<&serde_json::Value>, color: bool) -> S
         }
     };
 
+    let id = format!("#{message_id}");
+
     match content_type {
         "messageText" => content
             .get("text")
@@ -626,7 +792,7 @@ fn format_message_content(content: Option<&serde_json::Value>, color: bool) -> S
             .to_string(),
         "messagePhoto" => {
             let caption = get_caption(content);
-            let tag = color_tag("[Photo]");
+            let tag = color_tag(&format!("[Photo {id}]"));
             if caption.is_empty() {
                 tag
             } else {
@@ -645,11 +811,15 @@ fn format_message_content(content: Option<&serde_json::Value>, color: bool) -> S
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
             let tag = if !filename.is_empty() && size > 0 {
-                color_tag(&format!("[Video: {}, {}]", filename, format_bytes(size)))
+                color_tag(&format!(
+                    "[Video {id}: {}, {}]",
+                    filename,
+                    format_bytes(size)
+                ))
             } else if !filename.is_empty() {
-                color_tag(&format!("[Video: {}]", filename))
+                color_tag(&format!("[Video {id}: {}]", filename))
             } else {
-                color_tag("[Video]")
+                color_tag(&format!("[Video {id}]"))
             };
             let caption = get_caption(content);
             if caption.is_empty() {
@@ -670,11 +840,15 @@ fn format_message_content(content: Option<&serde_json::Value>, color: bool) -> S
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
             let tag = if !filename.is_empty() && size > 0 {
-                color_tag(&format!("[Document: {}, {}]", filename, format_bytes(size)))
+                color_tag(&format!(
+                    "[Document {id}: {}, {}]",
+                    filename,
+                    format_bytes(size)
+                ))
             } else if !filename.is_empty() {
-                color_tag(&format!("[Document: {}]", filename))
+                color_tag(&format!("[Document {id}: {}]", filename))
             } else {
-                color_tag("[Document]")
+                color_tag(&format!("[Document {id}]"))
             };
             let caption = get_caption(content);
             if caption.is_empty() {
@@ -690,9 +864,9 @@ fn format_message_content(content: Option<&serde_json::Value>, color: bool) -> S
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let tag = if !title.is_empty() {
-                color_tag(&format!("[Audio: {}]", title))
+                color_tag(&format!("[Audio {id}: {}]", title))
             } else {
-                color_tag("[Audio]")
+                color_tag(&format!("[Audio {id}]"))
             };
             let caption = get_caption(content);
             if caption.is_empty() {
@@ -703,7 +877,7 @@ fn format_message_content(content: Option<&serde_json::Value>, color: bool) -> S
         }
         "messageAnimation" => {
             let caption = get_caption(content);
-            let tag = color_tag("[GIF]");
+            let tag = color_tag(&format!("[GIF {id}]"));
             if caption.is_empty() {
                 tag
             } else {
@@ -712,14 +886,14 @@ fn format_message_content(content: Option<&serde_json::Value>, color: bool) -> S
         }
         "messageVoiceNote" => {
             let caption = get_caption(content);
-            let tag = color_tag("[Voice note]");
+            let tag = color_tag(&format!("[Voice note {id}]"));
             if caption.is_empty() {
                 tag
             } else {
                 format!("{}\n{}", tag, caption)
             }
         }
-        "messageVideoNote" => color_tag("[Video note]"),
+        "messageVideoNote" => color_tag(&format!("[Video note {id}]")),
         "messagePoll" => {
             let question = content
                 .get("poll")
@@ -728,9 +902,9 @@ fn format_message_content(content: Option<&serde_json::Value>, color: bool) -> S
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             if !question.is_empty() {
-                color_tag(&format!("[Poll: {}]", question))
+                color_tag(&format!("[Poll {id}: {}]", question))
             } else {
-                color_tag("[Poll]")
+                color_tag(&format!("[Poll {id}]"))
             }
         }
         "messageSticker" => {
@@ -740,12 +914,12 @@ fn format_message_content(content: Option<&serde_json::Value>, color: bool) -> S
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             if !emoji.is_empty() {
-                color_tag(&format!("[Sticker: {}]", emoji))
+                color_tag(&format!("[Sticker {id}: {}]", emoji))
             } else {
-                color_tag("[Sticker]")
+                color_tag(&format!("[Sticker {id}]"))
             }
         }
-        other => color_tag(&format!("[{}]", other)),
+        other => color_tag(&format!("[{other} {id}]")),
     }
 }
 
@@ -1153,6 +1327,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut messages = pin!(messages);
         let mut first = true;
+        let mut album_buf: Vec<ResolvedMessage> = Vec::new();
+        let mut album_id: i64 = 0;
+
+        let flush_album =
+            |buf: &mut Vec<ResolvedMessage>, first: &mut bool, output: &mut dyn Write| -> bool {
+                if buf.is_empty() {
+                    return true;
+                }
+                let formatted = format_album_human(buf, use_pager);
+                let result = if *first {
+                    *first = false;
+                    write!(output, "{}", formatted)
+                } else {
+                    write!(output, "\n{}", formatted)
+                };
+                buf.clear();
+                result.is_ok()
+            };
 
         while let Some((msg, sender_name, forward_origin_name)) =
             std::future::poll_fn(|cx| messages.as_mut().poll_next(cx)).await
@@ -1162,22 +1354,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     break;
                 }
             } else {
-                let formatted = format_message_human(
-                    &msg,
-                    sender_name.as_deref(),
-                    forward_origin_name.as_deref(),
-                    use_pager,
-                );
-                let result = if first {
-                    first = false;
-                    write!(output, "{}", formatted)
-                } else {
-                    write!(output, "\n{}", formatted)
+                let msg_album_id = get_media_album_id(&msg);
+                let resolved = ResolvedMessage {
+                    msg,
+                    sender_name,
+                    forward_origin_name,
                 };
-                if result.is_err() {
-                    break;
+
+                if msg_album_id != 0 && msg_album_id == album_id {
+                    album_buf.push(resolved);
+                } else {
+                    if !flush_album(&mut album_buf, &mut first, output.as_mut()) {
+                        break;
+                    }
+                    if msg_album_id != 0 {
+                        album_id = msg_album_id;
+                        album_buf.push(resolved);
+                    } else {
+                        album_id = 0;
+                        let formatted = format_message_human(
+                            &resolved.msg,
+                            resolved.sender_name.as_deref(),
+                            resolved.forward_origin_name.as_deref(),
+                            use_pager,
+                        );
+                        let result = if first {
+                            first = false;
+                            write!(output, "{}", formatted)
+                        } else {
+                            write!(output, "\n{}", formatted)
+                        };
+                        if result.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
+        }
+
+        if !json {
+            flush_album(&mut album_buf, &mut first, output.as_mut());
         }
 
         // Ensure trailing newline for json mode

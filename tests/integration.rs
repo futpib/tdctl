@@ -529,9 +529,25 @@ async fn start_slow_export_server() -> MockServer {
                 wr.write_all(b"\n").await.unwrap();
                 wr.flush().await.unwrap();
 
-                // Send slow progress updates
+                // Send slow progress updates, checking for cancelExport between each
+                let mut cancelled_by_client = false;
                 for i in 1..=20 {
                     sleep(Duration::from_millis(50)).await;
+
+                    // Check if client sent cancelExport
+                    line.clear();
+                    let cancel_check = tokio::time::timeout(
+                        Duration::from_millis(1),
+                        reader.read_line(&mut line),
+                    )
+                    .await;
+                    if let Ok(Ok(n)) = cancel_check {
+                        if n > 0 {
+                            cancelled_by_client = true;
+                            break;
+                        }
+                    }
+
                     let update = serde_json::json!({
                         "type": "tdesktop",
                         "payload": {
@@ -557,11 +573,13 @@ async fn start_slow_export_server() -> MockServer {
                     }
                 }
 
-                // Wait for cancelExport
-                line.clear();
-                let n = reader.read_line(&mut line).await.unwrap();
-                if n == 0 {
-                    return;
+                if !cancelled_by_client {
+                    // Wait for cancelExport
+                    line.clear();
+                    let n = reader.read_line(&mut line).await.unwrap();
+                    if n == 0 {
+                        return;
+                    }
                 }
 
                 // Send cancelled
