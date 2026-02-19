@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::pin::pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use chrono::{Local, TimeZone};
+use chrono::{Local, NaiveTime, TimeZone};
 use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::UnixStream;
@@ -68,6 +68,14 @@ enum Command {
         /// Maximum messages to fetch (0 = unlimited)
         #[arg(long, default_value_t = 0)]
         limit: u64,
+
+        /// Show messages after this date (e.g. "2025-01-01", "last monday")
+        #[arg(long, alias = "since")]
+        after: Option<String>,
+
+        /// Show messages before this date (e.g. "2025-01-01", "last monday")
+        #[arg(long, alias = "until")]
+        before: Option<String>,
 
         /// Output raw JSON (one message per line)
         #[arg(long)]
@@ -649,11 +657,7 @@ fn format_album_human(messages: &[ResolvedMessage], color: bool) -> String {
     let mut parts = Vec::new();
     let mut plain_parts = Vec::new();
 
-    let id = first
-        .msg
-        .get("id")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+    let id = first.msg.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
     let id_str = format!("#{id}");
     plain_parts.push(id_str.clone());
     if color {
@@ -973,6 +977,28 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+fn parse_date_arg(s: &str, end_of_day: bool) -> Result<i64, Box<dyn std::error::Error>> {
+    let now = Local::now().naive_local();
+    let result = human_date_parser::from_human_time(s, now)?;
+    let naive_dt = match result {
+        human_date_parser::ParseResult::DateTime(dt) => dt,
+        human_date_parser::ParseResult::Date(d) => {
+            let time = if end_of_day {
+                NaiveTime::from_hms_opt(23, 59, 59).unwrap()
+            } else {
+                NaiveTime::from_hms_opt(0, 0, 0).unwrap()
+            };
+            d.and_time(time)
+        }
+        human_date_parser::ParseResult::Time(t) => now.date().and_time(t),
+    };
+    let local_dt = Local
+        .from_local_datetime(&naive_dt)
+        .single()
+        .ok_or_else(|| format!("Ambiguous or invalid local time: {}", naive_dt))?;
+    Ok(local_dt.timestamp())
+}
+
 fn format_export_progress(payload: &serde_json::Value) {
     let state = payload.get("state").and_then(|v| v.as_str()).unwrap_or("");
     match state {
@@ -1247,9 +1273,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         chat,
         from,
         limit,
+        after,
+        before,
         json,
     } = cli.command
     {
+        let after_ts = after
+            .as_deref()
+            .map(|s| parse_date_arg(s, false))
+            .transpose()?;
+        let before_ts = before
+            .as_deref()
+            .map(|s| parse_date_arg(s, true))
+            .transpose()?;
+
         let chat_id = resolve_chat(&mut reader, &mut writer, account, &chat).await?;
 
         let use_pager = !json && std::io::stdout().is_terminal();
@@ -1267,8 +1304,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Box::new(std::io::stdout().lock())
         };
 
+        let initial_from = if from == 0 {
+            if let Some(ts) = before_ts {
+                let payload = serde_json::json!({
+                    "@type": "getChatMessageByDate",
+                    "chat_id": chat_id,
+                    "date": ts,
+                });
+                let response =
+                    send_tdlib_request_with_retry(&mut reader, &mut writer, account, payload)
+                        .await?;
+                if is_error_payload(&response) {
+                    let message = response
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown error");
+                    return Err(format!("Error finding message by date: {}", message).into());
+                }
+                response.get("id").and_then(|v| v.as_i64()).unwrap_or(0)
+            } else {
+                0
+            }
+        } else {
+            from
+        };
+
         let messages = async gen {
-            let mut from_message_id = from;
+            let mut from_message_id = initial_from;
             let mut remaining = limit;
             let mut name_cache = NameCache::default();
 
@@ -1341,7 +1403,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         None
                     };
 
+                    let msg_date = msg.get("date").and_then(|v| v.as_i64()).unwrap_or(0);
                     yield (msg, sender_name, forward_origin_name);
+                    if let Some(after) = after_ts
+                        && msg_date < after
+                    {
+                        return;
+                    }
                     if remaining > 0 {
                         remaining -= 1;
                         if remaining == 0 {

@@ -536,11 +536,9 @@ async fn start_slow_export_server() -> MockServer {
 
                     // Check if client sent cancelExport
                     line.clear();
-                    let cancel_check = tokio::time::timeout(
-                        Duration::from_millis(1),
-                        reader.read_line(&mut line),
-                    )
-                    .await;
+                    let cancel_check =
+                        tokio::time::timeout(Duration::from_millis(1), reader.read_line(&mut line))
+                            .await;
                     if let Ok(Ok(n)) = cancel_check {
                         if n > 0 {
                             cancelled_by_client = true;
