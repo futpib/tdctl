@@ -21,7 +21,7 @@ static EXTRA_COUNTER: AtomicU64 = AtomicU64::new(1);
 #[command(about = "CLI client for tdesktop Unix socket API")]
 struct Cli {
     /// Path to the tdesktop Unix socket
-    #[arg(long, global = true)]
+    #[arg(long, global = true, env = "TDCTL_SOCKET")]
     socket: Option<PathBuf>,
 
     /// Account index
