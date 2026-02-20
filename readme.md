@@ -35,6 +35,36 @@ tdctl get-history [OPTIONS] <CHAT>
 
 Date arguments accept natural language (e.g. `"2025-01-01"`, `"last monday"`).
 
+#### `send-message`
+
+Send a message to a chat.
+
+```
+tdctl send-message [OPTIONS] <CHAT> [TEXT]
+```
+
+`<CHAT>` is a numeric chat ID or `@username`.
+
+- `--photo <PATH>` — Photo file to attach (can be repeated)
+- `--video <PATH>` — Video file to attach (can be repeated)
+- `--document <PATH>` — Document file to attach (can be repeated)
+- `--audio <PATH>` — Audio file to attach (can be repeated)
+- `--file <PATH>` — Generic file, sent as document (can be repeated)
+- `--reply-to <ID>` — MTP message ID to reply to
+
+If no text argument is given and no files are specified, text is read from stdin. Multiple files are sent as an album; text becomes the caption on the first item.
+
+Prints the MTP message ID(s) of sent messages on success.
+
+```
+tdctl send-message @user "Hello"
+echo "Hello" | tdctl send-message @user
+tdctl send-message @user "Caption" --photo ./img.jpg
+tdctl send-message @user --photo a.jpg --photo b.jpg --video c.mp4
+tdctl send-message @user --document ./report.pdf
+tdctl send-message @user "Reply" --reply-to 42
+```
+
 #### `list-accounts`
 
 List available accounts.

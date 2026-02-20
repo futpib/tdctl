@@ -1647,7 +1647,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("Error: {}", message);
             std::process::exit(1);
         }
-        println!("{}", serde_json::to_string(&response)?);
+
+        let response_type = response.get("@type").and_then(|v| v.as_str()).unwrap_or("");
+        match response_type {
+            "message" => {
+                let tdlib_id =
+                    TdlibMessageId(response.get("id").and_then(|v| v.as_i64()).unwrap_or(0));
+                let mtp_id: MtpMessageId = tdlib_id.into();
+                println!("{mtp_id}");
+            }
+            "messages" => {
+                if let Some(messages) = response.get("messages").and_then(|v| v.as_array()) {
+                    for msg in messages {
+                        let tdlib_id =
+                            TdlibMessageId(msg.get("id").and_then(|v| v.as_i64()).unwrap_or(0));
+                        let mtp_id: MtpMessageId = tdlib_id.into();
+                        println!("{mtp_id}");
+                    }
+                }
+            }
+            _ => {
+                println!("{}", serde_json::to_string(&response)?);
+            }
+        }
 
         return Ok(());
     }
