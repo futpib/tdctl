@@ -1142,5 +1142,14 @@ async fn test_get_history_pagination() {
     );
     // Verify ordering: newest first
     let ids: Vec<i64> = messages.iter().map(|m| m["id"].as_i64().unwrap()).collect();
-    assert_eq!(ids, vec![5 * 1048576, 4 * 1048576, 3 * 1048576, 2 * 1048576, 1 * 1048576]);
+    assert_eq!(
+        ids,
+        vec![
+            5 * 1048576,
+            4 * 1048576,
+            3 * 1048576,
+            2 * 1048576,
+            1 * 1048576
+        ]
+    );
 }

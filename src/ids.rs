@@ -75,6 +75,12 @@ impl From<TdlibMessageId> for MtpMessageId {
     }
 }
 
+impl From<MtpMessageId> for TdlibMessageId {
+    fn from(id: MtpMessageId) -> Self {
+        TdlibMessageId(id.0 << 20)
+    }
+}
+
 const ZERO_CHANNEL_ID: i64 = -1_000_000_000_000;
 const ZERO_SECRET_CHAT_ID: i64 = -2_000_000_000_000;
 
@@ -107,6 +113,21 @@ mod tests {
         let tdlib = TdlibMessageId(123 << 20);
         let mtp: MtpMessageId = tdlib.into();
         assert_eq!(mtp.0, 123);
+    }
+
+    #[test]
+    fn message_id_reverse_conversion() {
+        let mtp = MtpMessageId(123);
+        let tdlib: TdlibMessageId = mtp.into();
+        assert_eq!(tdlib.0, 123 << 20);
+    }
+
+    #[test]
+    fn message_id_roundtrip() {
+        let original = MtpMessageId(456);
+        let tdlib: TdlibMessageId = original.into();
+        let back: MtpMessageId = tdlib.into();
+        assert_eq!(back.0, original.0);
     }
 
     #[test]

@@ -85,6 +85,40 @@ enum Command {
         json: bool,
     },
 
+    /// Send a message to a chat
+    SendMessage {
+        /// Chat ID or @username
+        #[arg(allow_hyphen_values = true)]
+        chat: String,
+
+        /// Message text (reads from stdin if omitted and no files given)
+        text: Option<String>,
+
+        /// Photo file to attach (can be repeated)
+        #[arg(long = "photo", value_name = "PATH")]
+        photos: Vec<PathBuf>,
+
+        /// Video file to attach (can be repeated)
+        #[arg(long = "video", value_name = "PATH")]
+        videos: Vec<PathBuf>,
+
+        /// Document file to attach (can be repeated)
+        #[arg(long = "document", value_name = "PATH")]
+        documents: Vec<PathBuf>,
+
+        /// Audio file to attach (can be repeated)
+        #[arg(long = "audio", value_name = "PATH")]
+        audios: Vec<PathBuf>,
+
+        /// Generic file to attach, sent as document (can be repeated)
+        #[arg(long = "file", value_name = "PATH")]
+        files: Vec<PathBuf>,
+
+        /// MTP message ID to reply to
+        #[arg(long)]
+        reply_to: Option<i64>,
+    },
+
     /// List available accounts
     ListAccounts,
 
@@ -1282,6 +1316,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             MtpCommand::Raw { json } => (json.clone(), Envelope::Mtp),
         },
         Command::GetHistory { .. } => (None, Envelope::Tdlib),
+        Command::SendMessage { .. } => (None, Envelope::Tdlib),
         Command::ListAccounts => (None, Envelope::Tdesktop),
         Command::Export { .. } => (None, Envelope::Tdesktop),
     };
@@ -1438,6 +1473,181 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", parts.join("\t"));
             }
         }
+
+        return Ok(());
+    }
+
+    if let Command::SendMessage {
+        chat,
+        text,
+        photos,
+        videos,
+        documents,
+        audios,
+        files,
+        reply_to,
+    } = cli.command
+    {
+        let chat_id = resolve_chat(&mut reader, &mut writer, account, &chat).await?;
+
+        #[derive(Clone, Copy)]
+        enum MediaType {
+            Photo,
+            Video,
+            Document,
+            Audio,
+        }
+
+        let mut media: Vec<(MediaType, PathBuf)> = Vec::new();
+        for p in photos {
+            media.push((MediaType::Photo, p.canonicalize()?));
+        }
+        for p in videos {
+            media.push((MediaType::Video, p.canonicalize()?));
+        }
+        for p in documents {
+            media.push((MediaType::Document, p.canonicalize()?));
+        }
+        for p in audios {
+            media.push((MediaType::Audio, p.canonicalize()?));
+        }
+        for p in files {
+            media.push((MediaType::Document, p.canonicalize()?));
+        }
+
+        let text = match text {
+            Some(t) => Some(t),
+            None if media.is_empty() && !std::io::stdin().is_terminal() => {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut buf)?;
+                if buf.is_empty() {
+                    return Err("no message text or files provided".into());
+                }
+                Some(buf)
+            }
+            None if media.is_empty() => {
+                return Err("no message text or files provided".into());
+            }
+            None => None,
+        };
+
+        let formatted_text = text.map(|t| {
+            serde_json::json!({
+                "@type": "formattedText",
+                "text": t,
+            })
+        });
+
+        let build_input_message_content = |media_type: MediaType,
+                                           path: &PathBuf,
+                                           caption: Option<&serde_json::Value>|
+         -> serde_json::Value {
+            let empty_text = serde_json::json!({"@type": "formattedText", "text": ""});
+            let caption = caption.unwrap_or(&empty_text);
+            match media_type {
+                MediaType::Photo => serde_json::json!({
+                    "@type": "inputMessagePhoto",
+                    "photo": {
+                        "@type": "inputFileLocal",
+                        "path": path.to_string_lossy(),
+                    },
+                    "caption": caption,
+                }),
+                MediaType::Video => serde_json::json!({
+                    "@type": "inputMessageVideo",
+                    "video": {
+                        "@type": "inputFileLocal",
+                        "path": path.to_string_lossy(),
+                    },
+                    "caption": caption,
+                }),
+                MediaType::Document => serde_json::json!({
+                    "@type": "inputMessageDocument",
+                    "document": {
+                        "@type": "inputFileLocal",
+                        "path": path.to_string_lossy(),
+                    },
+                    "caption": caption,
+                }),
+                MediaType::Audio => serde_json::json!({
+                    "@type": "inputMessageAudio",
+                    "audio": {
+                        "@type": "inputFileLocal",
+                        "path": path.to_string_lossy(),
+                    },
+                    "caption": caption,
+                }),
+            }
+        };
+
+        let reply_to_value = reply_to.map(|id| {
+            let tdlib_id: TdlibMessageId = MtpMessageId(id).into();
+            serde_json::json!({
+                "@type": "inputMessageReplyToMessage",
+                "message_id": tdlib_id.0,
+            })
+        });
+
+        let payload = if media.is_empty() {
+            let mut msg = serde_json::json!({
+                "@type": "sendMessage",
+                "chat_id": chat_id,
+                "input_message_content": {
+                    "@type": "inputMessageText",
+                    "text": formatted_text,
+                },
+            });
+            if let Some(reply) = &reply_to_value {
+                msg["reply_to"] = reply.clone();
+            }
+            msg
+        } else if media.len() == 1 {
+            let (mt, path) = &media[0];
+            let content = build_input_message_content(*mt, path, formatted_text.as_ref());
+            let mut msg = serde_json::json!({
+                "@type": "sendMessage",
+                "chat_id": chat_id,
+                "input_message_content": content,
+            });
+            if let Some(reply) = &reply_to_value {
+                msg["reply_to"] = reply.clone();
+            }
+            msg
+        } else {
+            let contents: Vec<serde_json::Value> = media
+                .iter()
+                .enumerate()
+                .map(|(i, (mt, path))| {
+                    let caption = if i == 0 {
+                        formatted_text.as_ref()
+                    } else {
+                        None
+                    };
+                    build_input_message_content(*mt, path, caption)
+                })
+                .collect();
+            let mut msg = serde_json::json!({
+                "@type": "sendMessageAlbum",
+                "chat_id": chat_id,
+                "input_message_contents": contents,
+            });
+            if let Some(reply) = &reply_to_value {
+                msg["reply_to"] = reply.clone();
+            }
+            msg
+        };
+
+        let response =
+            send_tdlib_request_with_retry(&mut reader, &mut writer, account, payload).await?;
+        if is_error_payload(&response) {
+            let message = response
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            eprintln!("Error: {}", message);
+            std::process::exit(1);
+        }
+        println!("{}", serde_json::to_string(&response)?);
 
         return Ok(());
     }
