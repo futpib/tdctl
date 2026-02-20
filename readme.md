@@ -1,0 +1,69 @@
+# tdctl
+
+CLI client for [tdesktop](https://github.com/futpib/tdesktop) Unix socket API.
+
+## Usage
+
+```
+tdctl [OPTIONS] <COMMAND>
+```
+
+### Global options
+
+- `--socket <SOCKET>` — Path to the tdesktop Unix socket (env: `TDCTL_SOCKET`)
+- `-a, --account <ACCOUNT>` — Account index
+
+If `--socket` is not specified and `TDCTL_SOCKET` is not set, the default path is `$XDG_RUNTIME_DIR/tdesktop.sock` or `/tmp/tdesktop-<uid>/tdesktop.sock`.
+
+### Commands
+
+#### `get-history`
+
+Browse chat message history.
+
+```
+tdctl get-history [OPTIONS] <CHAT>
+```
+
+`<CHAT>` is a numeric chat ID or `@username`.
+
+- `--from <ID>` — Start from this message ID (0 = latest)
+- `--limit <N>` — Maximum messages to fetch (0 = unlimited)
+- `--after <DATE>` / `--since <DATE>` — Show messages after this date
+- `--before <DATE>` / `--until <DATE>` — Show messages before this date
+- `--json` — Output raw JSON (one message per line)
+
+Date arguments accept natural language (e.g. `"2025-01-01"`, `"last monday"`).
+
+#### `list-accounts`
+
+List available accounts.
+
+```
+tdctl list-accounts
+```
+
+#### `export`
+
+Export data from tdesktop.
+
+```
+tdctl export [OPTIONS] <PATH>
+```
+
+- `--format <FORMAT>` — Export format: `json`, `html`, or `html_and_json` (default: `json`)
+- `--type <TYPES>` — Data types to export (comma-separated, defaults to all)
+- `--media-type <TYPES>` — Media types to download (comma-separated)
+- `--media-size-limit <BYTES>` — Media size limit in bytes
+- `--from-date <TIMESTAMP>` — Export messages after this Unix timestamp
+- `--till-date <TIMESTAMP>` — Export messages before this Unix timestamp
+
+#### `raw`, `tdlib raw`, `tdesktop raw`, `mtp raw`
+
+Send raw JSON to the socket, optionally wrapped in a TDLib, tdesktop, or MTP envelope. Reads from stdin if no argument is given.
+
+```
+tdctl raw '{"@type": "..."}'
+tdctl tdlib raw '{"@type": "getMe"}'
+tdctl mtp raw '{"@type": "..."}'
+```
