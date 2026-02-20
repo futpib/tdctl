@@ -1,5 +1,8 @@
 #![feature(async_iterator, gen_blocks)]
 
+mod ids;
+
+use ids::{MtpMessageId, MtpPeerId, TdlibDialogId, TdlibMessageId};
 use std::async_iter::AsyncIterator;
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
@@ -384,7 +387,11 @@ fn primary_username(response: &serde_json::Value) -> Option<&str> {
         .and_then(|v| v.as_str())
 }
 
-fn format_display_name(id: i64, handle: Option<&str>, full_name: &str) -> String {
+fn format_display_name(
+    id: impl std::fmt::Display,
+    handle: Option<&str>,
+    full_name: &str,
+) -> String {
     let mut parts = vec![format!("#{id}")];
     if let Some(h) = handle {
         parts.push(format!("@{h}"));
@@ -426,9 +433,9 @@ impl NameCache {
                     format!("{first} {last}")
                 };
                 let handle = primary_username(&response);
-                format_display_name(user_id, handle, &full_name)
+                format_display_name(ids::MtpUserId(user_id), handle, &full_name)
             }
-            _ => format!("#{user_id}"),
+            _ => format!("#{}", ids::MtpUserId(user_id)),
         };
         self.users.insert(user_id, name.clone());
         name
@@ -448,12 +455,13 @@ impl NameCache {
             "@type": "getChat",
             "chat_id": chat_id,
         });
+        let mtp_peer: MtpPeerId = TdlibDialogId(chat_id).into();
         let name = match send_tdlib_request_with_retry(reader, writer, account, payload).await {
             Ok(response) if !is_error_payload(&response) => {
                 let title = response.get("title").and_then(|v| v.as_str()).unwrap_or("");
-                format_display_name(chat_id, None, title)
+                format_display_name(&mtp_peer, None, title)
             }
-            _ => format!("#{chat_id}"),
+            _ => format!("#{mtp_peer}"),
         };
         self.chats.insert(chat_id, name.clone());
         name
@@ -691,8 +699,9 @@ fn format_message_human(
     let mut parts = Vec::new();
     let mut plain_parts = Vec::new();
 
-    let id = message.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
-    let id_str = format!("#{id}");
+    let tdlib_id = TdlibMessageId(message.get("id").and_then(|v| v.as_i64()).unwrap_or(0));
+    let mtp_id: MtpMessageId = tdlib_id.into();
+    let id_str = format!("#{mtp_id}");
     plain_parts.push(id_str.clone());
     if color {
         parts.push(format!("{ANSI_BOLD_CYAN}{id_str}{ANSI_RESET}"));
@@ -784,7 +793,7 @@ fn format_message_human(
         }
     }
 
-    let content = format_message_content(id, message.get("content"), color);
+    let content = format_message_content(mtp_id, message.get("content"), color);
     if content.is_empty() {
         header
     } else {
@@ -826,8 +835,9 @@ fn format_album_human(messages: &[ResolvedMessage], color: bool) -> String {
     let mut parts = Vec::new();
     let mut plain_parts = Vec::new();
 
-    let id = first.msg.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
-    let id_str = format!("#{id}");
+    let tdlib_id = TdlibMessageId(first.msg.get("id").and_then(|v| v.as_i64()).unwrap_or(0));
+    let mtp_id: MtpMessageId = tdlib_id.into();
+    let id_str = format!("#{mtp_id}");
     plain_parts.push(id_str.clone());
     if color {
         parts.push(format!("{ANSI_BOLD_CYAN}{id_str}{ANSI_RESET}"));
@@ -917,9 +927,10 @@ fn format_album_human(messages: &[ResolvedMessage], color: bool) -> String {
     let items: Vec<String> = messages
         .iter()
         .map(|m| {
-            let id = m.msg.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+            let tdlib_id = TdlibMessageId(m.msg.get("id").and_then(|v| v.as_i64()).unwrap_or(0));
+            let mtp_id: MtpMessageId = tdlib_id.into();
             let label = content_type_label(m.msg.get("content"));
-            format!("{label} #{id}")
+            format!("{label} #{mtp_id}")
         })
         .collect();
     let album_tag = format!("[{}]", items.join(", "));
@@ -961,7 +972,7 @@ fn format_view_count(count: i64) -> String {
 }
 
 fn format_message_content(
-    message_id: i64,
+    message_id: MtpMessageId,
     content: Option<&serde_json::Value>,
     color: bool,
 ) -> String {

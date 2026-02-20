@@ -926,16 +926,16 @@ async fn start_tdlib_chat_server() -> MockServer {
                                 .and_then(|v| v.as_i64())
                                 .unwrap_or(0);
 
-                            // Generate messages: IDs 5,4,3,2,1
-                            // from_id=0 means start from latest (return 5,4,3)
-                            // from_id=3 means return 2,1
-                            // from_id=1 means return empty (exhausted)
+                            // Generate messages with TDLib-style IDs (server_id << 20)
+                            // MTP IDs: 5,4,3,2,1 → TDLib IDs: 5242880,4194304,...
+                            // from_id=0 means start from latest (return top 3)
                             let all_messages: Vec<serde_json::Value> = (1..=5)
                                 .rev()
                                 .map(|i| {
+                                    let tdlib_id = i * 1048576; // i << 20
                                     serde_json::json!({
                                         "@type": "message",
-                                        "id": i,
+                                        "id": tdlib_id,
                                         "chat_id": -1001234567890_i64,
                                         "date": 1708185600 + i * 60,
                                         "author_signature": "Pavel Durov",
@@ -1031,8 +1031,8 @@ async fn test_get_history_json() {
         .collect();
 
     assert_eq!(messages.len(), 5);
-    assert_eq!(messages[0]["id"], 5);
-    assert_eq!(messages[4]["id"], 1);
+    assert_eq!(messages[0]["id"], 5 * 1048576);
+    assert_eq!(messages[4]["id"], 1 * 1048576);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1081,8 +1081,8 @@ async fn test_get_history_limit() {
         .collect();
 
     assert_eq!(messages.len(), 2);
-    assert_eq!(messages[0]["id"], 5);
-    assert_eq!(messages[1]["id"], 4);
+    assert_eq!(messages[0]["id"], 5 * 1048576);
+    assert_eq!(messages[1]["id"], 4 * 1048576);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1142,5 +1142,5 @@ async fn test_get_history_pagination() {
     );
     // Verify ordering: newest first
     let ids: Vec<i64> = messages.iter().map(|m| m["id"].as_i64().unwrap()).collect();
-    assert_eq!(ids, vec![5, 4, 3, 2, 1]);
+    assert_eq!(ids, vec![5 * 1048576, 4 * 1048576, 3 * 1048576, 2 * 1048576, 1 * 1048576]);
 }
