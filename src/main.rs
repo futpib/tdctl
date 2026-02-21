@@ -119,6 +119,16 @@ enum Command {
         reply_to: Option<i64>,
     },
 
+    /// Search for chats by name or username
+    SearchChats {
+        /// Search query
+        query: String,
+
+        /// Maximum results to show (default 20)
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+
     /// List available accounts
     ListAccounts,
 
@@ -1317,6 +1327,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         Command::GetHistory { .. } => (None, Envelope::Tdlib),
         Command::SendMessage { .. } => (None, Envelope::Tdlib),
+        Command::SearchChats { .. } => (None, Envelope::Tdlib),
         Command::ListAccounts => (None, Envelope::Tdesktop),
         Command::Export { .. } => (None, Envelope::Tdesktop),
     };
@@ -1431,6 +1442,191 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     writer.flush().await?;
                 }
             }
+        }
+
+        return Ok(());
+    }
+
+    if let Command::SearchChats { query, limit } = cli.command {
+        let server_payload = serde_json::json!({
+            "@type": "searchChatsOnServer",
+            "query": query,
+            "limit": limit,
+        });
+        let server_response =
+            send_tdlib_request_with_retry(&mut reader, &mut writer, account, server_payload)
+                .await?;
+
+        let public_payload = serde_json::json!({
+            "@type": "searchPublicChats",
+            "query": query,
+        });
+        let public_response =
+            send_tdlib_request_with_retry(&mut reader, &mut writer, account, public_payload)
+                .await?;
+
+        let mut seen = std::collections::HashSet::new();
+        let mut chat_ids: Vec<i64> = Vec::new();
+
+        for response in [&server_response, &public_response] {
+            if is_error_payload(response) {
+                continue;
+            }
+            if let Some(ids) = response.get("chat_ids").and_then(|v| v.as_array()) {
+                for id in ids {
+                    if let Some(id) = id.as_i64()
+                        && seen.insert(id)
+                    {
+                        chat_ids.push(id);
+                    }
+                }
+            }
+        }
+
+        chat_ids.truncate(limit as usize);
+
+        for chat_id in chat_ids {
+            let chat_payload = serde_json::json!({
+                "@type": "getChat",
+                "chat_id": chat_id,
+            });
+            let chat_response =
+                send_tdlib_request_with_retry(&mut reader, &mut writer, account, chat_payload)
+                    .await?;
+            if is_error_payload(&chat_response) {
+                continue;
+            }
+
+            let title = chat_response
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let mtp_peer: MtpPeerId = TdlibDialogId(chat_id).into();
+
+            let (username, member_count, type_label) = match chat_response
+                .get("type")
+                .and_then(|v| v.get("@type"))
+                .and_then(|v| v.as_str())
+            {
+                Some("chatTypePrivate") => {
+                    let user_id = chat_response
+                        .get("type")
+                        .and_then(|v| v.get("user_id"))
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    let user_payload = serde_json::json!({
+                        "@type": "getUser",
+                        "user_id": user_id,
+                    });
+                    let user_response = send_tdlib_request_with_retry(
+                        &mut reader,
+                        &mut writer,
+                        account,
+                        user_payload,
+                    )
+                    .await?;
+                    if !is_error_payload(&user_response) {
+                        let label = match user_response
+                            .get("type")
+                            .and_then(|v| v.get("@type"))
+                            .and_then(|v| v.as_str())
+                        {
+                            Some("userTypeBot") => Some("bot"),
+                            _ => None,
+                        };
+                        (
+                            primary_username(&user_response).map(|s| s.to_string()),
+                            None,
+                            label,
+                        )
+                    } else {
+                        (None, None, None)
+                    }
+                }
+                Some("chatTypeSupergroup") => {
+                    let supergroup_id = chat_response
+                        .get("type")
+                        .and_then(|v| v.get("supergroup_id"))
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    let sg_payload = serde_json::json!({
+                        "@type": "getSupergroup",
+                        "supergroup_id": supergroup_id,
+                    });
+                    let sg_response = send_tdlib_request_with_retry(
+                        &mut reader,
+                        &mut writer,
+                        account,
+                        sg_payload,
+                    )
+                    .await?;
+                    if !is_error_payload(&sg_response) {
+                        let count = sg_response
+                            .get("member_count")
+                            .and_then(|v| v.as_i64())
+                            .filter(|&c| c > 0);
+                        let is_channel = sg_response
+                            .get("is_channel")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let is_forum = sg_response
+                            .get("is_forum")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let label = if is_forum {
+                            "forum"
+                        } else if is_channel {
+                            "channel"
+                        } else {
+                            "group"
+                        };
+                        (
+                            primary_username(&sg_response).map(|s| s.to_string()),
+                            count,
+                            Some(label),
+                        )
+                    } else {
+                        (None, None, None)
+                    }
+                }
+                Some("chatTypeBasicGroup") => {
+                    let basic_group_id = chat_response
+                        .get("type")
+                        .and_then(|v| v.get("basic_group_id"))
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    let bg_payload = serde_json::json!({
+                        "@type": "getBasicGroup",
+                        "basic_group_id": basic_group_id,
+                    });
+                    let bg_response = send_tdlib_request_with_retry(
+                        &mut reader,
+                        &mut writer,
+                        account,
+                        bg_payload,
+                    )
+                    .await?;
+                    if !is_error_payload(&bg_response) {
+                        let count = bg_response
+                            .get("member_count")
+                            .and_then(|v| v.as_i64())
+                            .filter(|&c| c > 0);
+                        (None, count, Some("group"))
+                    } else {
+                        (None, None, Some("group"))
+                    }
+                }
+                _ => (None, None, None),
+            };
+
+            let mut display = format_display_name(&mtp_peer, username.as_deref(), title);
+            if let Some(label) = type_label {
+                display.push_str(&format!(" [{label}]"));
+            }
+            if let Some(count) = member_count {
+                display.push_str(&format!(" [{count} members]"));
+            }
+            println!("{display}");
         }
 
         return Ok(());

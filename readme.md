@@ -65,6 +65,21 @@ tdctl send-message @user --document ./report.pdf
 tdctl send-message @user "Reply" --reply-to 42
 ```
 
+#### `search-chats`
+
+Search for chats by name or username. Combines server-side and public search results.
+
+```
+tdctl search-chats [OPTIONS] <QUERY>
+```
+
+- `--limit <N>` — Maximum results to show (default: 20)
+
+```
+tdctl search-chats "linux"
+tdctl search-chats "durov" --limit 5
+```
+
 #### `list-accounts`
 
 List available accounts.
