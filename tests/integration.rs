@@ -1153,3 +1153,203 @@ async fn test_get_history_pagination() {
         ]
     );
 }
+
+/// A mock TDLib server for the `download` command. Serves `getMessage`
+/// (a document for any id except MTP 9, which is plain text) and `downloadFile`
+/// (returns a completed `file` pointing at a real on-disk source file). Returns
+/// the path of that source file so tests can compare bytes.
+async fn start_tdlib_download_server() -> (MockServer, PathBuf) {
+    let tempdir = TempDir::new().unwrap();
+    let socket_path = tempdir.path().join("test.sock");
+    let src_file = tempdir.path().join("source.bin");
+    std::fs::write(&src_file, b"FAKEPDFCONTENT").unwrap();
+    let src_str = src_file.to_string_lossy().into_owned();
+
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let src_str = src_str.clone();
+            tokio::spawn(async move {
+                let (rd, mut wr) = stream.into_split();
+                let mut reader = BufReader::new(rd);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    let n = reader.read_line(&mut line).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    let envelope: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                    let payload = &envelope["payload"];
+                    let extra = payload.get("@extra").cloned();
+                    let req_type = payload.get("@type").and_then(|v| v.as_str()).unwrap_or("");
+
+                    let mut response_payload = match req_type {
+                        "getMessage" => {
+                            let mid = payload
+                                .get("message_id")
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(0);
+                            // MTP id 9 (<< 20) is a text message with no media.
+                            let content = if mid == 9 * 1048576 {
+                                serde_json::json!({
+                                    "@type": "messageText",
+                                    "text": {"@type": "formattedText", "text": "hello"}
+                                })
+                            } else {
+                                serde_json::json!({
+                                    "@type": "messageDocument",
+                                    "document": {
+                                        "@type": "document",
+                                        "file_name": "report.pdf",
+                                        "document": {
+                                            "@type": "file",
+                                            "id": 42,
+                                            "size": 14,
+                                            "local": {
+                                                "@type": "localFile",
+                                                "path": "",
+                                                "is_downloading_completed": false,
+                                                "downloaded_size": 0
+                                            },
+                                            "remote": {"@type": "remoteFile"}
+                                        }
+                                    }
+                                })
+                            };
+                            serde_json::json!({
+                                "@type": "message",
+                                "id": mid,
+                                "chat_id": -1001234567890_i64,
+                                "content": content
+                            })
+                        }
+                        "downloadFile" => serde_json::json!({
+                            "@type": "file",
+                            "id": 42,
+                            "size": 14,
+                            "local": {
+                                "@type": "localFile",
+                                "path": src_str,
+                                "is_downloading_completed": true,
+                                "downloaded_size": 14
+                            },
+                            "remote": {"@type": "remoteFile"}
+                        }),
+                        "searchPublicChat" => serde_json::json!({
+                            "@type": "chat",
+                            "id": -1001234567890_i64,
+                            "title": "Test"
+                        }),
+                        _ => serde_json::json!({
+                            "@type": "error", "code": 404, "message": "Not Found"
+                        }),
+                    };
+                    if let Some(e) = &extra {
+                        response_payload["@extra"] = e.clone();
+                    }
+                    let response =
+                        serde_json::json!({"type": "tdlib", "payload": response_payload});
+                    let response_str = serde_json::to_string(&response).unwrap();
+                    wr.write_all(response_str.as_bytes()).await.unwrap();
+                    wr.write_all(b"\n").await.unwrap();
+                    wr.flush().await.unwrap();
+                }
+            });
+        }
+    });
+
+    (
+        MockServer {
+            socket_path,
+            _tempdir: tempdir,
+        },
+        src_file,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_download_to_directory() {
+    let (server, _src) = start_tdlib_download_server().await;
+    let outdir = TempDir::new().unwrap();
+    let output = tdctl_cmd(&server.socket_path)
+        .args(["download", "-1001234567890", "5", "--output"])
+        .arg(outdir.path())
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        output.status.success(),
+        "exit: {:?}\nstderr: {stderr}\nstdout: {stdout}",
+        output.status
+    );
+
+    // Copied into the directory under its original file name.
+    let target = outdir.path().join("report.pdf");
+    assert!(target.exists(), "target file should exist");
+    assert_eq!(std::fs::read(&target).unwrap(), b"FAKEPDFCONTENT");
+    // stdout is the resulting path.
+    assert_eq!(stdout.trim(), target.to_string_lossy());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_download_to_explicit_file() {
+    let (server, _src) = start_tdlib_download_server().await;
+    let outdir = TempDir::new().unwrap();
+    let target = outdir.path().join("renamed.dat");
+    let output = tdctl_cmd(&server.socket_path)
+        .args(["download", "-1001234567890", "5", "--output"])
+        .arg(&target)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(target.exists());
+    assert_eq!(std::fs::read(&target).unwrap(), b"FAKEPDFCONTENT");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_download_to_stdout() {
+    let (server, _src) = start_tdlib_download_server().await;
+    let output = tdctl_cmd(&server.socket_path)
+        .args(["download", "-1001234567890", "5", "--output", "-"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"FAKEPDFCONTENT");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_download_default_prints_cache_path() {
+    let (server, src) = start_tdlib_download_server().await;
+    let output = tdctl_cmd(&server.socket_path)
+        .args(["download", "-1001234567890", "5"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(output.status.success());
+    assert_eq!(stdout.trim(), src.to_string_lossy());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_download_no_media_errors() {
+    let (server, _src) = start_tdlib_download_server().await;
+    // MTP id 9 resolves to a plain text message — nothing to download.
+    let output = tdctl_cmd(&server.socket_path)
+        .args(["download", "-1001234567890", "9"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("no downloadable media"),
+        "stderr: {stderr}"
+    );
+}

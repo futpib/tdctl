@@ -161,6 +161,21 @@ enum Command {
         #[arg(long)]
         till_date: Option<i64>,
     },
+
+    /// Download media from a message to a file
+    Download {
+        /// Chat ID or @username
+        #[arg(allow_hyphen_values = true)]
+        chat: String,
+
+        /// Message ID to download from (as shown by get-history)
+        message_id: i64,
+
+        /// Output path: a file, a directory, or "-" for stdout.
+        /// Defaults to printing the downloaded file's cache path.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -384,6 +399,75 @@ async fn send_tdlib_request_with_retry(
             continue;
         }
         return Ok(response);
+    }
+}
+
+/// Download a file by TDLib file id, blocking until the transfer completes.
+///
+/// Uses `synchronous: true` so TDLib delivers a terminal `file` result (correlated
+/// by `@extra`) even when the file is already cached — meaning we never hang waiting
+/// for an `updateFile` that won't come. When `progress` is set, intervening
+/// `updateFile` events for this file are rendered as a live progress line on stderr.
+async fn download_file(
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    writer: &mut BufWriter<tokio::net::unix::OwnedWriteHalf>,
+    account: Option<u32>,
+    file_id: i64,
+    progress: bool,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let mut payload = serde_json::json!({
+        "@type": "downloadFile",
+        "file_id": file_id,
+        "priority": 1,
+        "offset": 0,
+        "limit": 0,
+        "synchronous": true,
+    });
+    let extra = inject_extra(&Envelope::Tdlib, &mut payload).unwrap();
+    let message = wrap(&Envelope::Tdlib, account, payload);
+    let line = serde_json::to_string(&message)?;
+    writer.write_all(line.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+
+    let mut last_pct: i64 = -1;
+    let mut printed_progress = false;
+    loop {
+        let mut response = String::new();
+        let n = reader.read_line(&mut response).await?;
+        if n == 0 {
+            return Err("unexpected EOF while downloading".into());
+        }
+        let parsed: serde_json::Value = serde_json::from_str(response.trim())?;
+        let mut payload = parsed["payload"].clone();
+
+        let matches = payload
+            .get("@extra")
+            .and_then(|v| v.get("tdctl"))
+            .and_then(|v| v.as_str())
+            == Some(extra.as_str());
+        if matches {
+            strip_extra(&mut payload);
+            if printed_progress {
+                eprintln!();
+            }
+            return Ok(payload);
+        }
+
+        if progress && payload.get("@type").and_then(|v| v.as_str()) == Some("updateFile") {
+            let file = payload.get("file");
+            let fid = file.and_then(|f| f.get("id")).and_then(|v| v.as_i64());
+            if fid == Some(file_id)
+                && let Some(file) = file
+                && let Some((pct, text)) = download_progress_line(file)
+                && pct != last_pct
+            {
+                last_pct = pct;
+                eprint!("\r{text}");
+                let _ = std::io::stderr().flush();
+                printed_progress = true;
+            }
+        }
     }
 }
 
@@ -1194,6 +1278,83 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// Locate the downloadable file inside a message's content, returning its TDLib
+/// file id and the original file name when the media type carries one.
+fn extract_downloadable_file(
+    content: Option<&serde_json::Value>,
+) -> Option<(i64, Option<String>)> {
+    let content = content?;
+    let named = |obj: &serde_json::Value| -> Option<String> {
+        obj.get("file_name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    };
+
+    let (file, name): (&serde_json::Value, Option<String>) =
+        match content.get("@type").and_then(|v| v.as_str())? {
+            "messagePhoto" => {
+                // Photos come in several sizes; pick the largest by pixel area.
+                let sizes = content.get("photo")?.get("sizes")?.as_array()?;
+                let largest = sizes.iter().max_by_key(|s| {
+                    let w = s.get("width").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let h = s.get("height").and_then(|v| v.as_i64()).unwrap_or(0);
+                    w * h
+                })?;
+                (largest.get("photo")?, None)
+            }
+            "messageVideo" => {
+                let v = content.get("video")?;
+                (v.get("video")?, named(v))
+            }
+            "messageDocument" => {
+                let d = content.get("document")?;
+                (d.get("document")?, named(d))
+            }
+            "messageAudio" => {
+                let a = content.get("audio")?;
+                (a.get("audio")?, named(a))
+            }
+            "messageAnimation" => {
+                let a = content.get("animation")?;
+                (a.get("animation")?, named(a))
+            }
+            "messageVoiceNote" => (content.get("voice_note")?.get("voice")?, None),
+            "messageVideoNote" => (content.get("video_note")?.get("video")?, None),
+            "messageSticker" => (content.get("sticker")?.get("sticker")?, None),
+            _ => return None,
+        };
+
+    let id = file.get("id").and_then(|v| v.as_i64())?;
+    Some((id, name))
+}
+
+/// Render a download progress line and its integer percent from a TDLib `file`.
+fn download_progress_line(file: &serde_json::Value) -> Option<(i64, String)> {
+    let total = file
+        .get("size")
+        .and_then(|v| v.as_u64())
+        .filter(|&s| s > 0)
+        .or_else(|| {
+            file.get("expected_size")
+                .and_then(|v| v.as_u64())
+                .filter(|&s| s > 0)
+        })?;
+    let downloaded = file
+        .get("local")
+        .and_then(|l| l.get("downloaded_size"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let pct = (downloaded.min(total) * 100 / total) as i64;
+    let text = format!(
+        "Downloading: {} / {} ({}%)",
+        format_bytes(downloaded),
+        format_bytes(total),
+        pct,
+    );
+    Some((pct, text))
+}
+
 fn parse_date_arg(s: &str, end_of_day: bool) -> Result<i64, Box<dyn std::error::Error>> {
     let now = Local::now().naive_local();
     let result = human_date_parser::from_human_time(s, now)?;
@@ -1330,6 +1491,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::SearchChats { .. } => (None, Envelope::Tdlib),
         Command::ListAccounts => (None, Envelope::Tdesktop),
         Command::Export { .. } => (None, Envelope::Tdesktop),
+        Command::Download { .. } => (None, Envelope::Tdlib),
     };
 
     let stream = UnixStream::connect(&socket_path).await?;
@@ -2102,6 +2264,88 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         drop(output);
         if let Some(mut child) = pager_child {
             let _ = child.wait();
+        }
+
+        return Ok(());
+    }
+
+    if let Command::Download {
+        chat,
+        message_id,
+        output,
+    } = cli.command
+    {
+        let chat_id = resolve_chat(&mut reader, &mut writer, account, &chat).await?;
+        let tdlib_message_id: TdlibMessageId = MtpMessageId(message_id).into();
+
+        let payload = serde_json::json!({
+            "@type": "getMessage",
+            "chat_id": chat_id,
+            "message_id": tdlib_message_id.0,
+        });
+        let message =
+            send_tdlib_request_with_retry(&mut reader, &mut writer, account, payload).await?;
+        if is_error_payload(&message) {
+            let msg = message
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            return Err(format!("Failed to fetch message {message_id}: {msg}").into());
+        }
+
+        let (file_id, suggested_name) = extract_downloadable_file(message.get("content"))
+            .ok_or_else(|| {
+                let label = content_type_label(message.get("content"));
+                format!("Message {message_id} has no downloadable media ({label})")
+            })?;
+
+        let show_progress = std::io::stderr().is_terminal();
+        let file =
+            download_file(&mut reader, &mut writer, account, file_id, show_progress).await?;
+        if is_error_payload(&file) {
+            let msg = file
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            return Err(format!("Failed to download file: {msg}").into());
+        }
+
+        let local_path = file
+            .get("local")
+            .and_then(|l| l.get("path"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or("download finished but TDLib returned no local path")?;
+        let size = file
+            .get("size")
+            .and_then(|v| v.as_u64())
+            .filter(|&s| s > 0)
+            .or_else(|| file.get("expected_size").and_then(|v| v.as_u64()))
+            .unwrap_or(0);
+
+        let to_stdout = output.as_ref().map(|p| p.as_os_str() == "-").unwrap_or(false);
+
+        if to_stdout {
+            let bytes = std::fs::read(local_path)?;
+            std::io::stdout().write_all(&bytes)?;
+        } else if let Some(out) = output {
+            let target = if out.is_dir() {
+                let name = suggested_name.unwrap_or_else(|| {
+                    std::path::Path::new(local_path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| message_id.to_string())
+                });
+                out.join(name)
+            } else {
+                out
+            };
+            std::fs::copy(local_path, &target)?;
+            eprintln!("Downloaded {} → {}", format_bytes(size), target.display());
+            println!("{}", target.display());
+        } else {
+            eprintln!("Downloaded {} → {}", format_bytes(size), local_path);
+            println!("{local_path}");
         }
 
         return Ok(());

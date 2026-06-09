@@ -35,6 +35,33 @@ tdctl get-history [OPTIONS] <CHAT>
 
 Date arguments accept natural language (e.g. `"2025-01-01"`, `"last monday"`).
 
+#### `download`
+
+Download media from a message to a file. Works for photos, videos, documents,
+audio, animations, voice/video notes, and stickers.
+
+```
+tdctl download [OPTIONS] <CHAT> <MESSAGE_ID>
+```
+
+`<CHAT>` is a numeric chat ID or `@username`. `<MESSAGE_ID>` is the message ID as
+printed by `get-history`.
+
+- `-o, --output <PATH>` — Where to write the file. If `PATH` is an existing
+  directory, the media is saved inside it under its original file name. Use `-`
+  to stream the raw bytes to stdout. If omitted, the file is downloaded into
+  TDLib's cache and its path is printed.
+
+The command blocks until the download finishes. The resulting file path is
+printed to stdout; progress and status are written to stderr.
+
+```
+tdctl download @user 185 -o ./photo.jpg
+tdctl download @user 185 -o ~/Downloads/   # keep the original file name
+tdctl download @user 185 -o - > image.jpg  # stream bytes to a file
+tdctl download @user 185                    # just print the cache path
+```
+
 #### `send-message`
 
 Send a message to a chat.
