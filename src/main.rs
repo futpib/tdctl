@@ -176,6 +176,36 @@ enum Command {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+
+    /// Stream new incoming messages in real time (TDLib updateNewMessage).
+    /// The socket server already broadcasts every TDLib update to all clients;
+    /// this consumes that stream and prints messages matching the filters as
+    /// they arrive -- no polling, no re-fetching. Ideal for a DM monitor.
+    Listen {
+        /// Only show messages in these chat IDs (repeatable; default: all chats)
+        #[arg(long = "chat", value_name = "ID", allow_hyphen_values = true)]
+        chats: Vec<i64>,
+
+        /// Only show messages from these sender user IDs (repeatable; default: all)
+        #[arg(long = "from", value_name = "ID")]
+        from: Vec<i64>,
+
+        /// Include your own outgoing messages (default: incoming only)
+        #[arg(long)]
+        include_outgoing: bool,
+
+        /// Exit after this many matching messages (0 = unlimited)
+        #[arg(long, default_value_t = 0)]
+        count: u64,
+
+        /// Exit after this many seconds (0 = run until killed)
+        #[arg(long, default_value_t = 0)]
+        timeout: u64,
+
+        /// Emit one JSON message object per line instead of a compact human line
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1469,6 +1499,141 @@ fn format_export_progress(payload: &serde_json::Value) {
     }
 }
 
+/// Extract a one-line text/label for a message content in `listen` plain output.
+fn listen_message_text(content: Option<&serde_json::Value>) -> String {
+    let Some(content) = content else {
+        return "[Unknown]".to_string();
+    };
+    let ty = content.get("@type").and_then(|v| v.as_str()).unwrap_or("");
+    if ty == "messageText" {
+        return content
+            .get("text")
+            .and_then(|t| t.get("text"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .replace('\n', " ");
+    }
+    let label = content_type_label(Some(content));
+    let caption = content
+        .get("caption")
+        .and_then(|c| c.get("text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .replace('\n', " ");
+    if caption.is_empty() {
+        format!("[{label}]")
+    } else {
+        format!("[{label}] {caption}")
+    }
+}
+
+/// Stream incoming TDLib `updateNewMessage` events from the socket, applying
+/// chat/sender/direction filters. Read-only: the socket server already
+/// broadcasts every TDLib update to all connected clients.
+async fn cmd_listen(
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    account: Option<u32>,
+    chats: &[i64],
+    from: &[i64],
+    include_outgoing: bool,
+    count: u64,
+    timeout: u64,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = if timeout > 0 {
+        Some(tokio::time::Instant::now() + std::time::Duration::from_secs(timeout))
+    } else {
+        None
+    };
+    let mut matched: u64 = 0;
+    let mut out = std::io::stdout();
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        let n = match deadline {
+            Some(d) => match tokio::time::timeout_at(d, reader.read_line(&mut line)).await {
+                Ok(r) => r?,
+                Err(_) => break,
+            },
+            None => reader.read_line(&mut line).await?,
+        };
+        if n == 0 {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if parsed.get("type").and_then(|v| v.as_str()) != Some("tdlib") {
+            continue;
+        }
+        if let Some(want) = account {
+            if parsed.get("account").and_then(|v| v.as_u64()) != Some(want as u64) {
+                continue;
+            }
+        }
+        let payload = &parsed["payload"];
+        if payload.get("@type").and_then(|v| v.as_str()) != Some("updateNewMessage") {
+            continue;
+        }
+        let msg = &payload["message"];
+
+        let is_outgoing = msg
+            .get("is_outgoing")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if is_outgoing && !include_outgoing {
+            continue;
+        }
+
+        let chat_id = msg.get("chat_id").and_then(|v| v.as_i64()).unwrap_or(0);
+        if !chats.is_empty() && !chats.contains(&chat_id) {
+            continue;
+        }
+
+        let sender_id = msg
+            .get("sender_id")
+            .and_then(|s| s.get("user_id"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        if !from.is_empty() && !from.contains(&sender_id) {
+            continue;
+        }
+
+        if json {
+            let s = serde_json::to_string(msg)?;
+            writeln!(out, "{s}")?;
+        } else {
+            let tdlib_id = TdlibMessageId(msg.get("id").and_then(|v| v.as_i64()).unwrap_or(0));
+            let mtp_id: MtpMessageId = tdlib_id.into();
+            let date = msg.get("date").and_then(|v| v.as_i64()).unwrap_or(0);
+            let dt = Local
+                .timestamp_opt(date, 0)
+                .single()
+                .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_default();
+            let text = listen_message_text(msg.get("content"));
+            writeln!(
+                out,
+                "#{mtp_id}  {dt}  chat {chat_id}  from #{sender_id}  {text}"
+            )?;
+        }
+        out.flush()?;
+
+        matched += 1;
+        if count > 0 && matched >= count {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -1492,12 +1657,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::ListAccounts => (None, Envelope::Tdesktop),
         Command::Export { .. } => (None, Envelope::Tdesktop),
         Command::Download { .. } => (None, Envelope::Tdlib),
+        Command::Listen { .. } => (None, Envelope::Tdlib),
     };
 
     let stream = UnixStream::connect(&socket_path).await?;
     let (rd, wr) = stream.into_split();
     let mut reader = BufReader::new(rd);
     let mut writer = BufWriter::new(wr);
+
+    if let Command::Listen {
+        chats,
+        from,
+        include_outgoing,
+        count,
+        timeout,
+        json,
+    } = &cli.command
+    {
+        return cmd_listen(
+            &mut reader,
+            account,
+            chats,
+            from,
+            *include_outgoing,
+            *count,
+            *timeout,
+            *json,
+        )
+        .await;
+    }
 
     if let Command::Export {
         path,
