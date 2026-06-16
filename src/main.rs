@@ -7,7 +7,6 @@ use std::async_iter::AsyncIterator;
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
-use std::pin::pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{Local, NaiveTime, TimeZone};
@@ -27,6 +26,10 @@ struct Cli {
     /// Account index
     #[arg(short, long, global = true)]
     account: Option<u32>,
+
+    /// Path to the config file (default: $XDG_CONFIG_HOME/tdctl/config.toml)
+    #[arg(long, global = true, env = "TDCTL_CONFIG")]
+    config: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -83,6 +86,14 @@ enum Command {
         /// Output raw JSON (one message per line)
         #[arg(long)]
         json: bool,
+
+        /// Mark fetched messages as read on the server (overrides config)
+        #[arg(long = "mark-read", overrides_with = "no_mark_read")]
+        mark_read: bool,
+
+        /// Do not mark fetched messages as read (overrides config)
+        #[arg(long = "no-mark-read", overrides_with = "mark_read")]
+        no_mark_read: bool,
     },
 
     /// Send a message to a chat
@@ -175,6 +186,14 @@ enum Command {
         /// Defaults to printing the downloaded file's cache path.
         #[arg(short, long)]
         output: Option<PathBuf>,
+
+        /// Mark the message as read on the server (overrides config)
+        #[arg(long = "mark-read", overrides_with = "no_mark_read")]
+        mark_read: bool,
+
+        /// Do not mark the message as read (overrides config)
+        #[arg(long = "no-mark-read", overrides_with = "mark_read")]
+        no_mark_read: bool,
     },
 
     /// Stream new incoming messages in real time (TDLib updateNewMessage).
@@ -205,6 +224,14 @@ enum Command {
         /// Emit one JSON message object per line instead of a compact human line
         #[arg(long)]
         json: bool,
+
+        /// Mark each matched message as read on the server (overrides config)
+        #[arg(long = "mark-read", overrides_with = "no_mark_read")]
+        mark_read: bool,
+
+        /// Do not mark matched messages as read (overrides config)
+        #[arg(long = "no-mark-read", overrides_with = "mark_read")]
+        no_mark_read: bool,
     },
 }
 
@@ -242,6 +269,73 @@ fn default_socket_path() -> PathBuf {
 
     let uid = unsafe { libc::getuid() };
     PathBuf::from(format!("/tmp/tdesktop-{uid}/tdesktop.sock"))
+}
+
+/// tdctl config, loaded from TOML. Every field is optional; a missing config
+/// file (or a missing key) just falls back to the next level of precedence.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default)]
+struct Config {
+    /// Global default for marking messages as read when a command reads them.
+    mark_read: Option<bool>,
+    #[serde(rename = "get-history")]
+    get_history: CommandConfig,
+    listen: CommandConfig,
+    download: CommandConfig,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default)]
+struct CommandConfig {
+    /// Per-command override of the global `mark_read` default.
+    mark_read: Option<bool>,
+}
+
+fn config_path(explicit: Option<&std::path::Path>) -> Option<PathBuf> {
+    if let Some(p) = explicit {
+        return Some(p.to_path_buf());
+    }
+    let base = std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .ok()
+        .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("tdctl").join("config.toml"))
+}
+
+/// Load config from the resolved path. A missing file is not an error (returns
+/// defaults); a malformed file warns on stderr and falls back to defaults.
+fn load_config(explicit: Option<&std::path::Path>) -> Config {
+    let Some(path) = config_path(explicit) else {
+        return Config::default();
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(text) => match toml::from_str(&text) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                eprintln!("Warning: failed to parse {}: {e}", path.display());
+                Config::default()
+            }
+        },
+        Err(_) => Config::default(),
+    }
+}
+
+/// Resolve whether to mark read, by precedence: CLI flag, then per-command
+/// config, then global config, then the built-in default (mark read).
+fn resolve_mark_read(cli: Option<bool>, per_cmd: Option<bool>, global: Option<bool>) -> bool {
+    cli.or(per_cmd).or(global).unwrap_or(true)
+}
+
+/// Turn the `--mark-read` / `--no-mark-read` flag pair (mutually exclusive via
+/// clap `overrides_with`) into an `Option<bool>`: `None` = defer to config.
+fn flag_tristate(mark_read: bool, no_mark_read: bool) -> Option<bool> {
+    if mark_read {
+        Some(true)
+    } else if no_mark_read {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 fn parse_json(text: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
@@ -430,6 +524,58 @@ async fn send_tdlib_request_with_retry(
         }
         return Ok(response);
     }
+}
+
+/// Write a TDLib request to the socket without awaiting its response. Used by
+/// the `listen` stream, where reading a correlated reply would consume (and
+/// drop) the very update events the listener is there to deliver. The eventual
+/// `ok` reply just flows back as another stream line and is ignored.
+async fn send_tdlib_fire_and_forget(
+    writer: &mut BufWriter<tokio::net::unix::OwnedWriteHalf>,
+    account: Option<u32>,
+    payload: serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let message = wrap(&Envelope::Tdlib, account, payload);
+    let line = serde_json::to_string(&message)?;
+    writer.write_all(line.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+/// Build a `viewMessages` payload that marks the given TDLib message ids read.
+fn view_messages_payload(chat_id: i64, message_ids: &[i64]) -> serde_json::Value {
+    serde_json::json!({
+        "@type": "viewMessages",
+        "chat_id": chat_id,
+        "message_ids": message_ids,
+        "source": { "@type": "messageSourceChatHistory" },
+        "force_read": true,
+    })
+}
+
+/// Mark the given TDLib message ids in a chat as read on the server, in
+/// batches. Best-effort: failures warn on stderr but are not fatal, since the
+/// command's primary output has already been produced.
+async fn mark_messages_read(
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    writer: &mut BufWriter<tokio::net::unix::OwnedWriteHalf>,
+    account: Option<u32>,
+    chat_id: i64,
+    message_ids: &[i64],
+) -> Result<(), Box<dyn std::error::Error>> {
+    for chunk in message_ids.chunks(100) {
+        let payload = view_messages_payload(chat_id, chunk);
+        let response = send_tdlib_request_with_retry(reader, writer, account, payload).await?;
+        if is_error_payload(&response) {
+            let m = response
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            eprintln!("Warning: mark-read failed for chat {chat_id}: {m}");
+        }
+    }
+    Ok(())
 }
 
 /// Download a file by TDLib file id, blocking until the transfer completes.
@@ -1530,8 +1676,10 @@ fn listen_message_text(content: Option<&serde_json::Value>) -> String {
 /// Stream incoming TDLib `updateNewMessage` events from the socket, applying
 /// chat/sender/direction filters. Read-only: the socket server already
 /// broadcasts every TDLib update to all connected clients.
+#[allow(clippy::too_many_arguments)]
 async fn cmd_listen(
     reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    writer: &mut BufWriter<tokio::net::unix::OwnedWriteHalf>,
     account: Option<u32>,
     chats: &[i64],
     from: &[i64],
@@ -1539,6 +1687,7 @@ async fn cmd_listen(
     count: u64,
     timeout: u64,
     json: bool,
+    mark_read: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = if timeout > 0 {
         Some(tokio::time::Instant::now() + std::time::Duration::from_secs(timeout))
@@ -1572,10 +1721,10 @@ async fn cmd_listen(
         if parsed.get("type").and_then(|v| v.as_str()) != Some("tdlib") {
             continue;
         }
-        if let Some(want) = account {
-            if parsed.get("account").and_then(|v| v.as_u64()) != Some(want as u64) {
-                continue;
-            }
+        if let Some(want) = account
+            && parsed.get("account").and_then(|v| v.as_u64()) != Some(want as u64)
+        {
+            continue;
         }
         let payload = &parsed["payload"];
         if payload.get("@type").and_then(|v| v.as_str()) != Some("updateNewMessage") {
@@ -1605,12 +1754,13 @@ async fn cmd_listen(
             continue;
         }
 
+        let msg_id = msg.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+
         if json {
             let s = serde_json::to_string(msg)?;
             writeln!(out, "{s}")?;
         } else {
-            let tdlib_id = TdlibMessageId(msg.get("id").and_then(|v| v.as_i64()).unwrap_or(0));
-            let mtp_id: MtpMessageId = tdlib_id.into();
+            let mtp_id: MtpMessageId = TdlibMessageId(msg_id).into();
             let date = msg.get("date").and_then(|v| v.as_i64()).unwrap_or(0);
             let dt = Local
                 .timestamp_opt(date, 0)
@@ -1624,6 +1774,14 @@ async fn cmd_listen(
             )?;
         }
         out.flush()?;
+
+        // Mark read as a fire-and-forget request: awaiting the reply here would
+        // consume the update stream we're listening on. Only incoming messages
+        // need it (own outgoing are already read).
+        if mark_read && !is_outgoing && msg_id != 0 {
+            let payload = view_messages_payload(chat_id, &[msg_id]);
+            let _ = send_tdlib_fire_and_forget(writer, account, payload).await;
+        }
 
         matched += 1;
         if count > 0 && matched >= count {
@@ -1639,6 +1797,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let socket_path = cli.socket.unwrap_or_else(default_socket_path);
     let account = cli.account;
+    let config = load_config(cli.config.as_deref());
 
     let (json_arg, envelope) = match &cli.command {
         Command::Raw { json } => (json.clone(), Envelope::None),
@@ -1672,10 +1831,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         count,
         timeout,
         json,
+        mark_read,
+        no_mark_read,
     } = &cli.command
     {
+        let mark_read = resolve_mark_read(
+            flag_tristate(*mark_read, *no_mark_read),
+            config.listen.mark_read,
+            config.mark_read,
+        );
         return cmd_listen(
             &mut reader,
+            &mut writer,
             account,
             chats,
             from,
@@ -1683,6 +1850,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             *count,
             *timeout,
             *json,
+            mark_read,
         )
         .await;
     }
@@ -2227,8 +2395,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         after,
         before,
         json,
+        mark_read,
+        no_mark_read,
     } = cli.command
     {
+        let mark_read = resolve_mark_read(
+            flag_tristate(mark_read, no_mark_read),
+            config.get_history.mark_read,
+            config.mark_read,
+        );
+
         let after_ts = after
             .as_deref()
             .map(|s| parse_date_arg(s, false))
@@ -2371,10 +2547,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        let mut messages = pin!(messages);
+        // Box::pin (rather than pin!) so the generator — which borrows reader and
+        // writer — can be dropped before we issue the mark-read requests below.
+        let mut messages = Box::pin(messages);
         let mut first = true;
         let mut album_buf: Vec<ResolvedMessage> = Vec::new();
         let mut album_id: i64 = 0;
+        let mut seen_ids: Vec<i64> = Vec::new();
 
         let flush_album =
             |buf: &mut Vec<ResolvedMessage>, first: &mut bool, output: &mut dyn Write| -> bool {
@@ -2395,6 +2574,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         while let Some((msg, sender_name, forward_origin_name)) =
             std::future::poll_fn(|cx| messages.as_mut().poll_next(cx)).await
         {
+            if mark_read && let Some(id) = msg.get("id").and_then(|v| v.as_i64()) {
+                seen_ids.push(id);
+            }
             if json {
                 if writeln!(output, "{}", serde_json::to_string(&msg)?).is_err() {
                     break;
@@ -2454,6 +2636,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = child.wait();
         }
 
+        // Drop the generator to release its borrow of reader/writer before the
+        // mark-read requests reuse them.
+        drop(messages);
+        if mark_read && !seen_ids.is_empty() {
+            mark_messages_read(&mut reader, &mut writer, account, chat_id, &seen_ids).await?;
+        }
+
         return Ok(());
     }
 
@@ -2461,8 +2650,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         chat,
         message_id,
         output,
+        mark_read,
+        no_mark_read,
     } = cli.command
     {
+        let mark_read = resolve_mark_read(
+            flag_tristate(mark_read, no_mark_read),
+            config.download.mark_read,
+            config.mark_read,
+        );
+
         let chat_id = resolve_chat(&mut reader, &mut writer, account, &chat).await?;
         let tdlib_message_id: TdlibMessageId = MtpMessageId(message_id).into();
 
@@ -2534,6 +2731,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             eprintln!("Downloaded {} → {}", format_bytes(size), local_path);
             println!("{local_path}");
+        }
+
+        if mark_read {
+            mark_messages_read(
+                &mut reader,
+                &mut writer,
+                account,
+                chat_id,
+                &[tdlib_message_id.0],
+            )
+            .await?;
         }
 
         return Ok(());

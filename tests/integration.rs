@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -1351,5 +1352,189 @@ async fn test_download_no_media_errors() {
     assert!(
         stderr.contains("no downloadable media"),
         "stderr: {stderr}"
+    );
+}
+
+/// Like `start_tdlib_chat_server`, but also records every `viewMessages` request
+/// payload it receives, so tests can assert mark-read behavior.
+async fn start_tdlib_chat_server_recording() -> (MockServer, Arc<Mutex<Vec<serde_json::Value>>>) {
+    let tempdir = TempDir::new().unwrap();
+    let socket_path = tempdir.path().join("test.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    let viewed: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let viewed_acc = viewed.clone();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let viewed_conn = viewed_acc.clone();
+            tokio::spawn(async move {
+                let (rd, mut wr) = stream.into_split();
+                let mut reader = BufReader::new(rd);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    let n = reader.read_line(&mut line).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    let envelope: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                    let payload = &envelope["payload"];
+                    let extra = payload.get("@extra").cloned();
+                    let req_type = payload.get("@type").and_then(|v| v.as_str()).unwrap_or("");
+
+                    let response_payload = match req_type {
+                        "searchPublicChat" => {
+                            let mut resp = serde_json::json!({
+                                "@type": "chat",
+                                "id": -1001234567890_i64,
+                                "title": "Test Channel",
+                            });
+                            if let Some(e) = &extra {
+                                resp["@extra"] = e.clone();
+                            }
+                            resp
+                        }
+                        "getChatHistory" => {
+                            let from_id = payload
+                                .get("from_message_id")
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(0);
+                            let all_messages: Vec<serde_json::Value> = (1..=5)
+                                .rev()
+                                .map(|i| {
+                                    let tdlib_id = i * 1048576;
+                                    serde_json::json!({
+                                        "@type": "message",
+                                        "id": tdlib_id,
+                                        "chat_id": -1001234567890_i64,
+                                        "date": 1708185600 + i * 60,
+                                        "content": {
+                                            "@type": "messageText",
+                                            "text": {
+                                                "@type": "formattedText",
+                                                "text": format!("Message {i}"),
+                                            }
+                                        },
+                                    })
+                                })
+                                .collect();
+                            let messages: Vec<serde_json::Value> = if from_id == 0 {
+                                all_messages.into_iter().take(3).collect()
+                            } else {
+                                all_messages
+                                    .into_iter()
+                                    .filter(|m| {
+                                        m.get("id").and_then(|v| v.as_i64()).unwrap_or(0) < from_id
+                                    })
+                                    .collect()
+                            };
+                            let mut resp = serde_json::json!({
+                                "@type": "messages",
+                                "total_count": messages.len(),
+                                "messages": messages,
+                            });
+                            if let Some(e) = &extra {
+                                resp["@extra"] = e.clone();
+                            }
+                            resp
+                        }
+                        "viewMessages" => {
+                            viewed_conn.lock().unwrap().push(payload.clone());
+                            let mut resp = serde_json::json!({ "@type": "ok" });
+                            if let Some(e) = &extra {
+                                resp["@extra"] = e.clone();
+                            }
+                            resp
+                        }
+                        _ => {
+                            let mut resp = serde_json::json!({
+                                "@type": "error",
+                                "code": 404,
+                                "message": "Not Found",
+                            });
+                            if let Some(e) = &extra {
+                                resp["@extra"] = e.clone();
+                            }
+                            resp
+                        }
+                    };
+
+                    let response = serde_json::json!({
+                        "type": "tdlib",
+                        "payload": response_payload,
+                    });
+                    let response_str = serde_json::to_string(&response).unwrap();
+                    wr.write_all(response_str.as_bytes()).await.unwrap();
+                    wr.write_all(b"\n").await.unwrap();
+                    wr.flush().await.unwrap();
+                }
+            });
+        }
+    });
+
+    (
+        MockServer {
+            socket_path,
+            _tempdir: tempdir,
+        },
+        viewed,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_get_history_mark_read_flag() {
+    let (server, viewed) = start_tdlib_chat_server_recording().await;
+    let output = tdctl_cmd(&server.socket_path)
+        .args(["get-history", "-1001234567890", "--json", "--mark-read"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let viewed = viewed.lock().unwrap();
+    // All 5 fetched messages marked read in a single viewMessages request.
+    assert_eq!(viewed.len(), 1, "expected exactly one viewMessages request");
+    let req = &viewed[0];
+    assert_eq!(req["chat_id"], -1001234567890_i64);
+    assert_eq!(req["force_read"], true);
+    let ids = req["message_ids"].as_array().unwrap();
+    assert_eq!(ids.len(), 5);
+    assert!(ids.contains(&serde_json::json!(5 * 1048576)));
+    assert!(ids.contains(&serde_json::json!(1048576)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_get_history_no_mark_read_flag() {
+    let (server, viewed) = start_tdlib_chat_server_recording().await;
+    let output = tdctl_cmd(&server.socket_path)
+        .args(["get-history", "-1001234567890", "--json", "--no-mark-read"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        viewed.lock().unwrap().is_empty(),
+        "no viewMessages expected with --no-mark-read"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_get_history_config_disables_mark_read() {
+    let (server, viewed) = start_tdlib_chat_server_recording().await;
+    // A config turning the (default-on) mark-read off globally, with no CLI flag.
+    let cfg_dir = TempDir::new().unwrap();
+    let cfg_path = cfg_dir.path().join("config.toml");
+    std::fs::write(&cfg_path, "mark_read = false\n").unwrap();
+
+    let output = tdctl_cmd(&server.socket_path)
+        .arg("--config")
+        .arg(&cfg_path)
+        .args(["get-history", "-1001234567890", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        viewed.lock().unwrap().is_empty(),
+        "config mark_read=false should suppress viewMessages"
     );
 }

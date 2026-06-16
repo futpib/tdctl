@@ -12,6 +12,7 @@ tdctl [OPTIONS] <COMMAND>
 
 - `--socket <SOCKET>` — Path to the tdesktop Unix socket (env: `TDCTL_SOCKET`)
 - `-a, --account <ACCOUNT>` — Account index
+- `--config <PATH>` — Path to the config file (env: `TDCTL_CONFIG`)
 
 If `--socket` is not specified and `TDCTL_SOCKET` is not set, the default path is `$XDG_RUNTIME_DIR/tdesktop.sock` or `/tmp/tdesktop-<uid>/tdesktop.sock`.
 
@@ -32,8 +33,35 @@ tdctl get-history [OPTIONS] <CHAT>
 - `--after <DATE>` / `--since <DATE>` — Show messages after this date
 - `--before <DATE>` / `--until <DATE>` — Show messages before this date
 - `--json` — Output raw JSON (one message per line)
+- `--mark-read` / `--no-mark-read` — Mark the fetched messages as read on the
+  server, or not. Overrides the config (see [Configuration](#configuration)).
 
 Date arguments accept natural language (e.g. `"2025-01-01"`, `"last monday"`).
+
+#### `listen`
+
+Stream new incoming messages in real time (TDLib `updateNewMessage`). The socket
+server already broadcasts every TDLib update to all clients; this consumes that
+stream and prints messages matching the filters as they arrive — no polling, no
+re-fetching. Ideal for a DM monitor.
+
+```
+tdctl listen [OPTIONS]
+```
+
+- `--chat <ID>` — Only show messages in these chat IDs (repeatable; default: all)
+- `--from <ID>` — Only show messages from these sender user IDs (repeatable)
+- `--include-outgoing` — Include your own outgoing messages (default: incoming only)
+- `--count <N>` — Exit after this many matching messages (0 = unlimited)
+- `--timeout <S>` — Exit after this many seconds (0 = run until killed)
+- `--json` — Emit one JSON message object per line instead of a compact human line
+- `--mark-read` / `--no-mark-read` — Mark each matched (incoming) message as read
+  on the server, or not. Overrides the config (see [Configuration](#configuration)).
+
+```
+tdctl listen --from 499210827 --json              # watch one sender, JSON out
+tdctl listen --chat -100123 --count 1 --timeout 30 # wait for one msg, then exit
+```
 
 #### `download`
 
@@ -51,6 +79,8 @@ printed by `get-history`.
   directory, the media is saved inside it under its original file name. Use `-`
   to stream the raw bytes to stdout. If omitted, the file is downloaded into
   TDLib's cache and its path is printed.
+- `--mark-read` / `--no-mark-read` — Mark the message as read on the server, or
+  not. Overrides the config (see [Configuration](#configuration)).
 
 The command blocks until the download finishes. The resulting file path is
 printed to stdout; progress and status are written to stderr.
@@ -138,4 +168,40 @@ Send raw JSON to the socket, optionally wrapped in a TDLib, tdesktop, or MTP env
 tdctl raw '{"@type": "..."}'
 tdctl tdlib raw '{"@type": "getMe"}'
 tdctl mtp raw '{"@type": "..."}'
+```
+
+## Configuration
+
+tdctl reads an optional TOML config file. The path is, in order:
+`--config <PATH>`, the `TDCTL_CONFIG` env var, or
+`$XDG_CONFIG_HOME/tdctl/config.toml` (i.e. `~/.config/tdctl/config.toml`). A
+missing file is fine; a malformed one warns and falls back to defaults.
+
+### Marking messages as read
+
+The commands that read message content — `get-history`, `listen`, and
+`download` — can mark those messages as read on the server (TDLib
+`viewMessages` with `force_read`). Whether they do is resolved by precedence,
+highest first:
+
+1. The `--mark-read` / `--no-mark-read` CLI flag
+2. The per-command `mark_read` config key
+3. The global `mark_read` config key
+4. The built-in default, which is **on** (mark read)
+
+```toml
+# ~/.config/tdctl/config.toml
+
+# Global default for all read-marking commands (built-in default: true).
+mark_read = true
+
+# Optional per-command overrides of the global default.
+[get-history]
+mark_read = false
+
+[listen]
+mark_read = true
+
+[download]
+mark_read = false
 ```
