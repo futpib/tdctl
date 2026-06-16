@@ -291,32 +291,29 @@ struct CommandConfig {
     mark_read: Option<bool>,
 }
 
-fn config_path(explicit: Option<&std::path::Path>) -> Option<PathBuf> {
-    if let Some(p) = explicit {
-        return Some(p.to_path_buf());
-    }
-    let base = std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .ok()
-        .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("tdctl").join("config.toml"))
-}
-
-/// Load config from the resolved path. A missing file is not an error (returns
-/// defaults); a malformed file warns on stderr and falls back to defaults.
+/// Load config from the first existing XDG config file. The `xdg` crate does
+/// the spec-compliant search of `$XDG_CONFIG_HOME` (default `$HOME/.config`)
+/// then `$XDG_CONFIG_DIRS` (default `/etc/xdg`), handling unset/empty/relative
+/// env values. An explicit path (`--config` / `TDCTL_CONFIG`) short-circuits
+/// the search. A missing file yields defaults; a file that exists but fails to
+/// parse warns on stderr and falls back to defaults.
 fn load_config(explicit: Option<&std::path::Path>) -> Config {
-    let Some(path) = config_path(explicit) else {
+    let path = match explicit {
+        Some(p) => Some(p.to_path_buf()),
+        None => xdg::BaseDirectories::with_prefix("tdctl").find_config_file("config.toml"),
+    };
+    let Some(path) = path else {
         return Config::default();
     };
-    match std::fs::read_to_string(&path) {
-        Ok(text) => match toml::from_str(&text) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                eprintln!("Warning: failed to parse {}: {e}", path.display());
-                Config::default()
-            }
-        },
-        Err(_) => Config::default(),
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Config::default();
+    };
+    match toml::from_str(&text) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("Warning: failed to parse {}: {e}", path.display());
+            Config::default()
+        }
     }
 }
 

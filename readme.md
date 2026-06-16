@@ -172,10 +172,12 @@ tdctl mtp raw '{"@type": "..."}'
 
 ## Configuration
 
-tdctl reads an optional TOML config file. The path is, in order:
-`--config <PATH>`, the `TDCTL_CONFIG` env var, or
-`$XDG_CONFIG_HOME/tdctl/config.toml` (i.e. `~/.config/tdctl/config.toml`). A
-missing file is fine; a malformed one warns and falls back to defaults.
+tdctl reads an optional TOML config file. An explicit `--config <PATH>` (or the
+`TDCTL_CONFIG` env var) is used directly; otherwise tdctl follows the XDG Base
+Directory Specification, searching `$XDG_CONFIG_HOME/tdctl/config.toml` (default
+`~/.config/tdctl/config.toml`) and then each `$XDG_CONFIG_DIRS` entry (default
+`/etc/xdg/tdctl/config.toml`), using the first that exists. A missing file is
+fine; a malformed one warns and falls back to defaults.
 
 ### Marking messages as read
 
