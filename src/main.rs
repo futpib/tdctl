@@ -2255,37 +2255,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
          -> serde_json::Value {
             let empty_text = serde_json::json!({"@type": "formattedText", "text": ""});
             let caption = caption.unwrap_or(&empty_text);
+            // tdlib schema change: inputMessage{Photo,Video,Document,Audio} no longer take an
+            // InputFile directly -- the file is wrapped in input{Photo,Video,Document,Audio}.
+            let file = serde_json::json!({
+                "@type": "inputFileLocal",
+                "path": path.to_string_lossy(),
+            });
             match media_type {
                 MediaType::Photo => serde_json::json!({
                     "@type": "inputMessagePhoto",
-                    "photo": {
-                        "@type": "inputFileLocal",
-                        "path": path.to_string_lossy(),
-                    },
+                    "photo": { "@type": "inputPhoto", "photo": file },
                     "caption": caption,
                 }),
                 MediaType::Video => serde_json::json!({
                     "@type": "inputMessageVideo",
-                    "video": {
-                        "@type": "inputFileLocal",
-                        "path": path.to_string_lossy(),
-                    },
+                    "video": { "@type": "inputVideo", "video": file },
                     "caption": caption,
                 }),
                 MediaType::Document => serde_json::json!({
                     "@type": "inputMessageDocument",
-                    "document": {
-                        "@type": "inputFileLocal",
-                        "path": path.to_string_lossy(),
-                    },
+                    "document": { "@type": "inputDocument", "document": file },
                     "caption": caption,
                 }),
                 MediaType::Audio => serde_json::json!({
                     "@type": "inputMessageAudio",
-                    "audio": {
-                        "@type": "inputFileLocal",
-                        "path": path.to_string_lossy(),
-                    },
+                    "audio": { "@type": "inputAudio", "audio": file },
                     "caption": caption,
                 }),
             }
