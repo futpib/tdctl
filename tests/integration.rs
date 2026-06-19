@@ -1504,6 +1504,118 @@ async fn test_get_history_mark_read_flag() {
     assert!(ids.contains(&serde_json::json!(1048576)));
 }
 
+/// A mock server for `listen`: on connect, broadcast the given pre-serialized
+/// update lines, then close (EOF) so the client flushes any pending album and
+/// exits. `listen` sends no request first, so we ignore the read half.
+async fn start_listen_server(lines: Vec<serde_json::Value>) -> MockServer {
+    let tempdir = TempDir::new().unwrap();
+    let socket_path = tempdir.path().join("test.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let lines = lines.clone();
+            tokio::spawn(async move {
+                let (_rd, mut wr) = stream.into_split();
+                for l in &lines {
+                    wr.write_all(serde_json::to_string(l).unwrap().as_bytes())
+                        .await
+                        .unwrap();
+                    wr.write_all(b"\n").await.unwrap();
+                    wr.flush().await.unwrap();
+                }
+                // Drop wr -> EOF, prompting the client to flush and exit.
+            });
+        }
+    });
+
+    MockServer {
+        socket_path,
+        _tempdir: tempdir,
+    }
+}
+
+fn new_message_update(message: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "type": "tdlib",
+        "payload": {"@type": "updateNewMessage", "message": message}
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_listen_human_flags() {
+    // A single text message that is edited, a reply, and has a view count: the
+    // compact line must surface all three (TDLib ids are MTP << 20).
+    let msg = serde_json::json!({
+        "id": 100i64 << 20,
+        "chat_id": 777,
+        "sender_id": {"@type": "messageSenderUser", "user_id": 888},
+        "date": 1_700_000_000,
+        "edit_date": 1_700_000_100i64,
+        "reply_to": {"@type": "messageReplyToMessage", "chat_id": 777, "message_id": 50i64 << 20},
+        "interaction_info": {"view_count": 1500},
+        "content": {"@type": "messageText", "text": {"text": "hi", "entities": []}}
+    });
+    let server = start_listen_server(vec![new_message_update(msg)]).await;
+    let output = tdctl_cmd(&server.socket_path)
+        .args(["listen", "--no-mark-read"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(output.status.success(), "stdout: {stdout}");
+    assert!(stdout.contains("#100"), "id missing: {stdout}");
+    assert!(stdout.contains("chat 777"), "chat missing: {stdout}");
+    assert!(stdout.contains("from #888"), "sender missing: {stdout}");
+    assert!(stdout.contains("(edited)"), "edited missing: {stdout}");
+    assert!(stdout.contains("reply to #50"), "reply missing: {stdout}");
+    assert!(stdout.contains("1,500 views"), "views missing: {stdout}");
+    assert!(stdout.contains("hi"), "text missing: {stdout}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_listen_human_album_coalesced() {
+    // Two photos sharing a media_album_id arrive as separate updates; the first
+    // is a reply. They must collapse into one line carrying both ids and the
+    // reply marker (album_id sent as a string, the form TDLib uses).
+    let m1 = serde_json::json!({
+        "id": 200i64 << 20,
+        "chat_id": 777,
+        "sender_id": {"@type": "messageSenderUser", "user_id": 888},
+        "date": 1_700_000_000,
+        "media_album_id": "999",
+        "reply_to": {"@type": "messageReplyToMessage", "chat_id": 777, "message_id": 150i64 << 20},
+        "content": {"@type": "messagePhoto", "caption": {"text": "", "entities": []}}
+    });
+    let m2 = serde_json::json!({
+        "id": 201i64 << 20,
+        "chat_id": 777,
+        "sender_id": {"@type": "messageSenderUser", "user_id": 888},
+        "date": 1_700_000_000,
+        "media_album_id": "999",
+        "content": {"@type": "messagePhoto", "caption": {"text": "", "entities": []}}
+    });
+    let server =
+        start_listen_server(vec![new_message_update(m1), new_message_update(m2)]).await;
+    let output = tdctl_cmd(&server.socket_path)
+        .args(["listen", "--no-mark-read"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(output.status.success(), "stdout: {stdout}");
+    let body = stdout.trim();
+    assert_eq!(
+        body.lines().count(),
+        1,
+        "album should be one coalesced line: {stdout}"
+    );
+    assert!(
+        body.contains("[Photo #200, Photo #201]"),
+        "album tag missing: {stdout}"
+    );
+    assert!(body.contains("reply to #150"), "reply missing: {stdout}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_get_history_no_mark_read_flag() {
     let (server, viewed) = start_tdlib_chat_server_recording().await;

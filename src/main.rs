@@ -1069,6 +1069,16 @@ fn format_message_human(
         }
     }
 
+    if let Some(reply_id) = reply_target_mtp(message) {
+        let reply_label = format!("reply to #{reply_id}");
+        plain_parts.push(reply_label.clone());
+        if color {
+            parts.push(format!("{ANSI_DIM}{reply_label}{ANSI_RESET}"));
+        } else {
+            parts.push(reply_label);
+        }
+    }
+
     let view_count = message
         .get("interaction_info")
         .and_then(|v| v.get("view_count"))
@@ -1115,6 +1125,122 @@ fn get_media_album_id(msg: &serde_json::Value) -> i64 {
                 .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
         })
         .unwrap_or(0)
+}
+
+/// If this message is an in-chat reply to another message, return the target's
+/// MTP id. Returns None for plain messages and for non-message reply targets
+/// (e.g. `messageReplyToStory`). The `message_id` in `reply_to` is in TDLib
+/// form (shifted), so convert it to the MTP id used everywhere else in output.
+fn reply_target_mtp(msg: &serde_json::Value) -> Option<MtpMessageId> {
+    let reply = msg.get("reply_to")?;
+    if reply.get("@type").and_then(|v| v.as_str()) != Some("messageReplyToMessage") {
+        return None;
+    }
+    let mid = reply
+        .get("message_id")
+        .and_then(|v| v.as_i64())
+        .filter(|&id| id != 0)?;
+    Some(TdlibMessageId(mid).into())
+}
+
+/// Build the trailing metadata segments shared by the compact `listen` line:
+/// edited / forwarded / reply / views. Returns "" when none apply, otherwise a
+/// string with a leading two-space separator ready to splice into a line.
+fn message_flag_segments(msg: &serde_json::Value) -> String {
+    let mut segs: Vec<String> = Vec::new();
+    if msg.get("edit_date").and_then(|v| v.as_i64()).unwrap_or(0) > 0 {
+        segs.push("(edited)".to_string());
+    }
+    if msg.get("forward_info").map(|v| !v.is_null()).unwrap_or(false) {
+        segs.push("forwarded".to_string());
+    }
+    if let Some(reply_id) = reply_target_mtp(msg) {
+        segs.push(format!("reply to #{reply_id}"));
+    }
+    let views = msg
+        .get("interaction_info")
+        .and_then(|v| v.get("view_count"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    if views > 0 {
+        segs.push(format!("{} views", format_view_count(views)));
+    }
+    if segs.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", segs.join("  "))
+    }
+}
+
+/// Format a coalesced album for the compact `listen` stream. Mirrors
+/// `format_album_human`'s `[Photo #a, Video #b]` tag but keeps `listen`'s
+/// single-line `chat .. from #..` shape. `buf` holds (message, chat_id,
+/// sender_id) tuples, ordered by arrival.
+fn format_listen_album(buf: &[(serde_json::Value, i64, i64)]) -> String {
+    let (first, chat_id, sender_id) = &buf[0];
+    let mtp: MtpMessageId =
+        TdlibMessageId(first.get("id").and_then(|v| v.as_i64()).unwrap_or(0)).into();
+    let date = first.get("date").and_then(|v| v.as_i64()).unwrap_or(0);
+    let dt = Local
+        .timestamp_opt(date, 0)
+        .single()
+        .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_default();
+
+    let items: Vec<String> = buf
+        .iter()
+        .map(|(m, _, _)| {
+            let id: MtpMessageId =
+                TdlibMessageId(m.get("id").and_then(|v| v.as_i64()).unwrap_or(0)).into();
+            format!("{} #{id}", content_type_label(m.get("content")))
+        })
+        .collect();
+    let album_tag = format!("[{}]", items.join(", "));
+
+    // Reuse the single-message flags for edited/forwarded/reply off the first
+    // message, but override views with the album-wide max (matching
+    // `format_album_human`).
+    let mut segs: Vec<String> = Vec::new();
+    if first.get("edit_date").and_then(|v| v.as_i64()).unwrap_or(0) > 0 {
+        segs.push("(edited)".to_string());
+    }
+    if first.get("forward_info").map(|v| !v.is_null()).unwrap_or(false) {
+        segs.push("forwarded".to_string());
+    }
+    if let Some(reply_id) = reply_target_mtp(first) {
+        segs.push(format!("reply to #{reply_id}"));
+    }
+    let views = buf
+        .iter()
+        .map(|(m, _, _)| {
+            m.get("interaction_info")
+                .and_then(|v| v.get("view_count"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+        })
+        .max()
+        .unwrap_or(0);
+    if views > 0 {
+        segs.push(format!("{} views", format_view_count(views)));
+    }
+    let flags = if segs.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", segs.join("  "))
+    };
+
+    let caption = buf
+        .iter()
+        .map(|(m, _, _)| get_caption_from_message(m, false))
+        .find(|c| !c.is_empty())
+        .unwrap_or_default();
+    let caption = if caption.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", caption.replace('\n', " "))
+    };
+
+    format!("#{mtp}  {dt}  chat {chat_id}  from #{sender_id}{flags}  {album_tag}{caption}")
 }
 
 fn content_type_label(content: Option<&serde_json::Value>) -> &'static str {
@@ -1191,6 +1317,16 @@ fn format_album_human(messages: &[ResolvedMessage], color: bool) -> String {
             parts.push(format!("{ANSI_DIM}{fwd_label}{ANSI_RESET}"));
         } else {
             parts.push(fwd_label);
+        }
+    }
+
+    if let Some(reply_id) = reply_target_mtp(&first.msg) {
+        let reply_label = format!("reply to #{reply_id}");
+        plain_parts.push(reply_label.clone());
+        if color {
+            parts.push(format!("{ANSI_DIM}{reply_label}{ANSI_RESET}"));
+        } else {
+            parts.push(reply_label);
         }
     }
 
@@ -1695,16 +1831,56 @@ async fn cmd_listen(
     let mut out = std::io::stdout();
     let mut line = String::new();
 
+    // Album coalescing for the human stream: media albums arrive as separate
+    // `updateNewMessage` events, so buffer consecutive same-album messages and
+    // emit them as one line once the album is complete. Completion is detected
+    // by a differing message arriving, or by a short grace period elapsing with
+    // no continuation (TDLib delivers album members back-to-back). Single
+    // (non-album) messages never enter the buffer, so they incur no latency.
+    const ALBUM_GRACE_MS: u64 = 300;
+    let mut album_buf: Vec<(serde_json::Value, i64, i64)> = Vec::new();
+    let mut album_id_cur: i64 = 0;
+
     loop {
         line.clear();
-        let n = match deadline {
-            Some(d) => match tokio::time::timeout_at(d, reader.read_line(&mut line)).await {
+        let n = if !album_buf.is_empty() {
+            // Hold open only briefly while an album is pending, then flush it.
+            let grace =
+                tokio::time::Instant::now() + std::time::Duration::from_millis(ALBUM_GRACE_MS);
+            let eff = match deadline {
+                Some(d) => d.min(grace),
+                None => grace,
+            };
+            match tokio::time::timeout_at(eff, reader.read_line(&mut line)).await {
                 Ok(r) => r?,
-                Err(_) => break,
-            },
-            None => reader.read_line(&mut line).await?,
+                Err(_) => {
+                    writeln!(out, "{}", format_listen_album(&album_buf))?;
+                    out.flush()?;
+                    album_buf.clear();
+                    album_id_cur = 0;
+                    if let Some(d) = deadline
+                        && tokio::time::Instant::now() >= d
+                    {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        } else {
+            match deadline {
+                Some(d) => match tokio::time::timeout_at(d, reader.read_line(&mut line)).await {
+                    Ok(r) => r?,
+                    Err(_) => break,
+                },
+                None => reader.read_line(&mut line).await?,
+            }
         };
         if n == 0 {
+            if !album_buf.is_empty() {
+                writeln!(out, "{}", format_listen_album(&album_buf))?;
+                out.flush()?;
+                album_buf.clear();
+            }
             break;
         }
         let trimmed = line.trim();
@@ -1753,25 +1929,6 @@ async fn cmd_listen(
 
         let msg_id = msg.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
 
-        if json {
-            let s = serde_json::to_string(msg)?;
-            writeln!(out, "{s}")?;
-        } else {
-            let mtp_id: MtpMessageId = TdlibMessageId(msg_id).into();
-            let date = msg.get("date").and_then(|v| v.as_i64()).unwrap_or(0);
-            let dt = Local
-                .timestamp_opt(date, 0)
-                .single()
-                .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
-                .unwrap_or_default();
-            let text = listen_message_text(msg.get("content"));
-            writeln!(
-                out,
-                "#{mtp_id}  {dt}  chat {chat_id}  from #{sender_id}  {text}"
-            )?;
-        }
-        out.flush()?;
-
         // Mark read as a fire-and-forget request: awaiting the reply here would
         // consume the update stream we're listening on. Only incoming messages
         // need it (own outgoing are already read).
@@ -1779,6 +1936,57 @@ async fn cmd_listen(
             let payload = view_messages_payload(chat_id, &[msg_id]);
             let _ = send_tdlib_fire_and_forget(writer, account, payload).await;
         }
+
+        if json {
+            // Raw mode passes the untouched message object through; reply, album
+            // and all other metadata are already present, so no coalescing.
+            let s = serde_json::to_string(msg)?;
+            writeln!(out, "{s}")?;
+            out.flush()?;
+            matched += 1;
+            if count > 0 && matched >= count {
+                break;
+            }
+            continue;
+        }
+
+        let this_album = get_media_album_id(msg);
+
+        // A non-continuing message ends any pending album: flush it first.
+        if !album_buf.is_empty() && this_album != album_id_cur {
+            writeln!(out, "{}", format_listen_album(&album_buf))?;
+            out.flush()?;
+            album_buf.clear();
+            album_id_cur = 0;
+        }
+
+        if this_album != 0 {
+            album_id_cur = this_album;
+            album_buf.push((msg.clone(), chat_id, sender_id));
+            matched += 1;
+            if count > 0 && matched >= count {
+                writeln!(out, "{}", format_listen_album(&album_buf))?;
+                out.flush()?;
+                album_buf.clear();
+                break;
+            }
+            continue;
+        }
+
+        let mtp_id: MtpMessageId = TdlibMessageId(msg_id).into();
+        let date = msg.get("date").and_then(|v| v.as_i64()).unwrap_or(0);
+        let dt = Local
+            .timestamp_opt(date, 0)
+            .single()
+            .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_default();
+        let text = listen_message_text(msg.get("content"));
+        let flags = message_flag_segments(msg);
+        writeln!(
+            out,
+            "#{mtp_id}  {dt}  chat {chat_id}  from #{sender_id}{flags}  {text}"
+        )?;
+        out.flush()?;
 
         matched += 1;
         if count > 0 && matched >= count {
