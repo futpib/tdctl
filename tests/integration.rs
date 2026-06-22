@@ -1543,6 +1543,127 @@ fn new_message_update(message: serde_json::Value) -> serde_json::Value {
     })
 }
 
+/// A mock server for `send-message`: answers the `sendMessage` request with a
+/// pending message (temp id 100 << 20), then broadcasts the terminal send
+/// update. `succeed=true` -> updateMessageSendSucceeded with a new id
+/// (200 << 20); `succeed=false` -> updateMessageSendFailed ("caption too long").
+async fn start_send_result_server(succeed: bool) -> MockServer {
+    let tempdir = TempDir::new().unwrap();
+    let socket_path = tempdir.path().join("test.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let (rd, mut wr) = stream.into_split();
+                let mut reader = BufReader::new(rd);
+                let mut line = String::new();
+                let n = reader.read_line(&mut line).await.unwrap();
+                if n == 0 {
+                    return;
+                }
+                let req: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                let extra = req["payload"]["@extra"].clone();
+                let temp_id: i64 = 100 << 20;
+
+                // Initial pending response, correlated by @extra.
+                let resp = serde_json::json!({
+                    "type": "tdlib",
+                    "payload": {
+                        "@type": "message", "id": temp_id, "@extra": extra,
+                        "sending_state": {"@type": "messageSendingStatePending"}
+                    }
+                });
+                wr.write_all(serde_json::to_string(&resp).unwrap().as_bytes())
+                    .await
+                    .unwrap();
+                wr.write_all(b"\n").await.unwrap();
+                wr.flush().await.unwrap();
+
+                // Terminal send update arriving after the response.
+                let update = if succeed {
+                    serde_json::json!({"type": "tdlib", "payload": {
+                        "@type": "updateMessageSendSucceeded",
+                        "old_message_id": temp_id,
+                        "message": {"@type": "message", "id": 200i64 << 20}
+                    }})
+                } else {
+                    serde_json::json!({"type": "tdlib", "payload": {
+                        "@type": "updateMessageSendFailed",
+                        "old_message_id": temp_id,
+                        "error": {"@type": "error", "code": 400, "message": "Message caption is too long"}
+                    }})
+                };
+                let _ = wr
+                    .write_all(serde_json::to_string(&update).unwrap().as_bytes())
+                    .await;
+                let _ = wr.write_all(b"\n").await;
+                let _ = wr.flush().await;
+            });
+        }
+    });
+
+    MockServer {
+        socket_path,
+        _tempdir: tempdir,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_send_message_reports_async_failure() {
+    // An async updateMessageSendFailed must surface as a nonzero exit + stderr,
+    // not the old silent rc=0 (the "caption too long" trap).
+    let server = start_send_result_server(false).await;
+    let output = tdctl_cmd(&server.socket_path)
+        .args(["send-message", "777", "hello", "--send-timeout", "5"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !output.status.success(),
+        "should exit nonzero on send failure; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("caption is too long"),
+        "stderr should carry the server error: {stderr}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_send_message_reports_final_id_on_success() {
+    // On confirmation, print the permanent id (200) rather than the temp id.
+    let server = start_send_result_server(true).await;
+    let output = tdctl_cmd(&server.socket_path)
+        .args(["send-message", "777", "hello", "--send-timeout", "5"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(stdout.trim(), "200", "expected final id, got: {stdout}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_send_message_no_wait_returns_temp_id() {
+    // --no-wait must not block for confirmation: it prints the temp id (100)
+    // immediately and exits 0, ignoring the later success update.
+    let server = start_send_result_server(true).await;
+    let output = tdctl_cmd(&server.socket_path)
+        .args(["send-message", "777", "hello", "--no-wait"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        "100",
+        "no-wait should return the temp id"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_listen_human_flags() {
     // A single text message that is edited, a reply, and has a view count: the

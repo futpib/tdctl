@@ -128,6 +128,19 @@ enum Command {
         /// MTP message ID to reply to
         #[arg(long)]
         reply_to: Option<i64>,
+
+        /// Return as soon as the message is queued, without waiting for the
+        /// server to confirm it actually sent. Restores the old fire-and-return
+        /// behaviour (a queued send that the server later rejects -- e.g.
+        /// "caption too long" -- will not be reported).
+        #[arg(long = "no-wait")]
+        no_wait: bool,
+
+        /// How long to wait (seconds) for send confirmation before giving up and
+        /// reporting the message as still pending (exit 0). Generous by default
+        /// so large uploads aren't reported as failed.
+        #[arg(long = "send-timeout", value_name = "SECS", default_value_t = 120)]
+        send_timeout: u64,
     },
 
     /// Search for chats by name or username
@@ -538,6 +551,108 @@ async fn send_tdlib_fire_and_forget(
     writer.write_all(b"\n").await?;
     writer.flush().await?;
     Ok(())
+}
+
+/// The terminal fate of a queued outgoing message.
+enum SendOutcome {
+    /// The server confirmed the send and assigned a permanent id.
+    Succeeded { final_id: MtpMessageId },
+    /// The server rejected the send (e.g. "Message caption is too long").
+    Failed { error: String },
+    /// No confirmation arrived before the timeout -- likely still uploading.
+    Pending { temp_id: MtpMessageId },
+}
+
+/// After a `sendMessage`/`sendMessageAlbum` request returns its (pending)
+/// message(s), watch the broadcast stream for the matching
+/// `updateMessageSendSucceeded` / `updateMessageSendFailed` updates so callers
+/// learn whether the message *actually* sent. TDLib emits these after the
+/// initial response, so they are not swallowed by the request correlator.
+/// `temp_ids` are the TDLib ids from the initial response, in order; one
+/// outcome is returned per id (unresolved ones come back as `Pending`).
+async fn await_send_outcomes(
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    account: Option<u32>,
+    temp_ids: &[i64],
+    timeout: std::time::Duration,
+) -> Result<Vec<SendOutcome>, Box<dyn std::error::Error>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut resolved: Vec<Option<SendOutcome>> = (0..temp_ids.len()).map(|_| None).collect();
+    let mut remaining = temp_ids.len();
+    let mut line = String::new();
+
+    while remaining > 0 {
+        line.clear();
+        let n = match tokio::time::timeout_at(deadline, reader.read_line(&mut line)).await {
+            Ok(r) => r?,
+            Err(_) => break, // timeout -> leave the rest Pending
+        };
+        if n == 0 {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if parsed.get("type").and_then(|v| v.as_str()) != Some("tdlib") {
+            continue;
+        }
+        if let Some(want) = account
+            && parsed.get("account").and_then(|v| v.as_u64()) != Some(want as u64)
+        {
+            continue;
+        }
+        let payload = &parsed["payload"];
+        let ptype = payload.get("@type").and_then(|v| v.as_str()).unwrap_or("");
+        let old_id = payload
+            .get("old_message_id")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let Some(idx) = temp_ids.iter().position(|&t| t == old_id) else {
+            continue;
+        };
+        if resolved[idx].is_some() {
+            continue;
+        }
+        match ptype {
+            "updateMessageSendSucceeded" => {
+                let new_id = payload
+                    .get("message")
+                    .and_then(|m| m.get("id"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(old_id);
+                resolved[idx] = Some(SendOutcome::Succeeded {
+                    final_id: TdlibMessageId(new_id).into(),
+                });
+                remaining -= 1;
+            }
+            "updateMessageSendFailed" => {
+                let error = payload
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "send failed".to_string());
+                resolved[idx] = Some(SendOutcome::Failed { error });
+                remaining -= 1;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(temp_ids
+        .iter()
+        .zip(resolved)
+        .map(|(&t, outcome)| {
+            outcome.unwrap_or(SendOutcome::Pending {
+                temp_id: TdlibMessageId(t).into(),
+            })
+        })
+        .collect())
 }
 
 /// Build a `viewMessages` payload that marks the given TDLib message ids read.
@@ -2405,6 +2520,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         audios,
         files,
         reply_to,
+        no_wait,
+        send_timeout,
     } = cli.command
     {
         let chat_id = resolve_chat(&mut reader, &mut writer, account, &chat).await?;
@@ -2561,27 +2678,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
 
+        // The initial response carries the message(s) in a *pending* state with
+        // temporary ids; the real send may still fail asynchronously. Collect
+        // the temp ids so we can wait for the terminal send update.
         let response_type = response.get("@type").and_then(|v| v.as_str()).unwrap_or("");
-        match response_type {
-            "message" => {
-                let tdlib_id =
-                    TdlibMessageId(response.get("id").and_then(|v| v.as_i64()).unwrap_or(0));
-                let mtp_id: MtpMessageId = tdlib_id.into();
+        let temp_ids: Vec<i64> = match response_type {
+            "message" => vec![response.get("id").and_then(|v| v.as_i64()).unwrap_or(0)],
+            "messages" => response
+                .get("messages")
+                .and_then(|v| v.as_array())
+                .map(|msgs| {
+                    msgs.iter()
+                        .map(|m| m.get("id").and_then(|v| v.as_i64()).unwrap_or(0))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            _ => {
+                // Unexpected shape: fall back to dumping the raw response.
+                println!("{}", serde_json::to_string(&response)?);
+                return Ok(());
+            }
+        };
+
+        if no_wait {
+            for &t in &temp_ids {
+                let mtp_id: MtpMessageId = TdlibMessageId(t).into();
                 println!("{mtp_id}");
             }
-            "messages" => {
-                if let Some(messages) = response.get("messages").and_then(|v| v.as_array()) {
-                    for msg in messages {
-                        let tdlib_id =
-                            TdlibMessageId(msg.get("id").and_then(|v| v.as_i64()).unwrap_or(0));
-                        let mtp_id: MtpMessageId = tdlib_id.into();
-                        println!("{mtp_id}");
-                    }
+            return Ok(());
+        }
+
+        let outcomes = await_send_outcomes(
+            &mut reader,
+            account,
+            &temp_ids,
+            std::time::Duration::from_secs(send_timeout),
+        )
+        .await?;
+
+        let mut any_failed = false;
+        for outcome in &outcomes {
+            match outcome {
+                SendOutcome::Succeeded { final_id } => println!("{final_id}"),
+                SendOutcome::Pending { temp_id } => {
+                    println!("{temp_id}");
+                    eprintln!(
+                        "Warning: send not confirmed within {send_timeout}s (#{temp_id} may still be uploading)"
+                    );
+                }
+                SendOutcome::Failed { error } => {
+                    any_failed = true;
+                    eprintln!("Error: send failed: {error}");
                 }
             }
-            _ => {
-                println!("{}", serde_json::to_string(&response)?);
-            }
+        }
+        if any_failed {
+            std::process::exit(1);
         }
 
         return Ok(());
