@@ -1155,23 +1155,30 @@ async fn test_get_history_pagination() {
     );
 }
 
-/// A mock TDLib server for the `download` command. Serves `getMessage`
-/// (a document for any id except MTP 9, which is plain text) and `downloadFile`
-/// (returns a completed `file` pointing at a real on-disk source file). Returns
-/// the path of that source file so tests can compare bytes.
-async fn start_tdlib_download_server() -> (MockServer, PathBuf) {
+/// A mock TDLib server for the `download` command. The first `interruptions`
+/// download requests return a partial local file before a completed response.
+async fn start_tdlib_download_server_with_interruptions(
+    interruptions: usize,
+) -> (MockServer, PathBuf, Arc<Mutex<usize>>) {
     let tempdir = TempDir::new().unwrap();
     let socket_path = tempdir.path().join("test.sock");
     let src_file = tempdir.path().join("source.bin");
     std::fs::write(&src_file, b"FAKEPDFCONTENT").unwrap();
     let src_str = src_file.to_string_lossy().into_owned();
+    let partial_file = tempdir.path().join("partial.bin");
+    std::fs::write(&partial_file, b"PARTIAL").unwrap();
+    let partial_str = partial_file.to_string_lossy().into_owned();
+    let download_attempts = Arc::new(Mutex::new(0_usize));
 
     let listener = UnixListener::bind(&socket_path).unwrap();
+    let server_attempts = Arc::clone(&download_attempts);
 
     tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
             let src_str = src_str.clone();
+            let partial_str = partial_str.clone();
+            let download_attempts = Arc::clone(&server_attempts);
             tokio::spawn(async move {
                 let (rd, mut wr) = stream.into_split();
                 let mut reader = BufReader::new(rd);
@@ -1193,52 +1200,84 @@ async fn start_tdlib_download_server() -> (MockServer, PathBuf) {
                                 .get("message_id")
                                 .and_then(|v| v.as_i64())
                                 .unwrap_or(0);
-                            // MTP id 9 (<< 20) is a text message with no media.
-                            let content = if mid == 9 * 1048576 {
+                            if mid != 5 * 1048576 && mid != 9 * 1048576 {
                                 serde_json::json!({
-                                    "@type": "messageText",
-                                    "text": {"@type": "formattedText", "text": "hello"}
+                                    "@type": "error", "code": 404, "message": "Not Found"
+                                })
+                            } else {
+                                // MTP id 9 (<< 20) is a text message with no media.
+                                let content = if mid == 9 * 1048576 {
+                                    serde_json::json!({
+                                        "@type": "messageText",
+                                        "text": {"@type": "formattedText", "text": "hello"}
+                                    })
+                                } else {
+                                    serde_json::json!({
+                                        "@type": "messageDocument",
+                                        "document": {
+                                            "@type": "document",
+                                            "file_name": "report.pdf",
+                                            "document": {
+                                                "@type": "file",
+                                                "id": 42,
+                                                "size": 14,
+                                                "local": {
+                                                    "@type": "localFile",
+                                                    "path": "",
+                                                    "is_downloading_completed": false,
+                                                    "downloaded_size": 0
+                                                },
+                                                "remote": {"@type": "remoteFile"}
+                                            }
+                                        }
+                                    })
+                                };
+                                serde_json::json!({
+                                    "@type": "message",
+                                    "id": mid,
+                                    "chat_id": -1001234567890_i64,
+                                    "content": content
+                                })
+                            }
+                        }
+                        "downloadFile" => {
+                            let attempt = {
+                                let mut attempts = download_attempts.lock().unwrap();
+                                *attempts += 1;
+                                *attempts
+                            };
+                            if attempt <= interruptions {
+                                serde_json::json!({
+                                    "@type": "file",
+                                    "id": 42,
+                                    "size": 14,
+                                    "local": {
+                                        "@type": "localFile",
+                                        "path": partial_str,
+                                        "can_be_downloaded": true,
+                                        "is_downloading_active": false,
+                                        "is_downloading_completed": false,
+                                        "downloaded_size": 7
+                                    },
+                                    "remote": {"@type": "remoteFile"}
                                 })
                             } else {
                                 serde_json::json!({
-                                    "@type": "messageDocument",
-                                    "document": {
-                                        "@type": "document",
-                                        "file_name": "report.pdf",
-                                        "document": {
-                                            "@type": "file",
-                                            "id": 42,
-                                            "size": 14,
-                                            "local": {
-                                                "@type": "localFile",
-                                                "path": "",
-                                                "is_downloading_completed": false,
-                                                "downloaded_size": 0
-                                            },
-                                            "remote": {"@type": "remoteFile"}
-                                        }
-                                    }
+                                    "@type": "file",
+                                    "id": 42,
+                                    "size": 14,
+                                    "local": {
+                                        "@type": "localFile",
+                                        "path": src_str,
+                                        "can_be_downloaded": false,
+                                        "is_downloading_active": false,
+                                        "is_downloading_completed": true,
+                                        "downloaded_size": 14
+                                    },
+                                    "remote": {"@type": "remoteFile"}
                                 })
-                            };
-                            serde_json::json!({
-                                "@type": "message",
-                                "id": mid,
-                                "chat_id": -1001234567890_i64,
-                                "content": content
-                            })
+                            }
                         }
-                        "downloadFile" => serde_json::json!({
-                            "@type": "file",
-                            "id": 42,
-                            "size": 14,
-                            "local": {
-                                "@type": "localFile",
-                                "path": src_str,
-                                "is_downloading_completed": true,
-                                "downloaded_size": 14
-                            },
-                            "remote": {"@type": "remoteFile"}
-                        }),
                         "searchPublicChat" => serde_json::json!({
                             "@type": "chat",
                             "id": -1001234567890_i64,
@@ -1268,7 +1307,13 @@ async fn start_tdlib_download_server() -> (MockServer, PathBuf) {
             _tempdir: tempdir,
         },
         src_file,
+        download_attempts,
     )
+}
+
+async fn start_tdlib_download_server() -> (MockServer, PathBuf) {
+    let (server, src_file, _) = start_tdlib_download_server_with_interruptions(0).await;
+    (server, src_file)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1314,6 +1359,82 @@ async fn test_download_to_explicit_file() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_download_accepts_raw_tdlib_message_id() {
+    let (server, src) = start_tdlib_download_server().await;
+    let raw_message_id = (5_i64 * 1048576).to_string();
+    let output = tdctl_cmd(&server.socket_path)
+        .args([
+            "download",
+            "-1001234567890",
+            raw_message_id.as_str(),
+            "--no-mark-read",
+        ])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        src.to_string_lossy()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_download_resumes_after_incomplete_response() {
+    let (server, _src, attempts) = start_tdlib_download_server_with_interruptions(2).await;
+    let outdir = TempDir::new().unwrap();
+    let target = outdir.path().join("resumed.dat");
+    let output = tdctl_cmd(&server.socket_path)
+        .args([
+            "download",
+            "-1001234567890",
+            "5",
+            "--no-mark-read",
+            "--output",
+        ])
+        .arg(&target)
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert_eq!(*attempts.lock().unwrap(), 3);
+    assert!(
+        stderr.contains("resuming (attempt 2/5)"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), b"FAKEPDFCONTENT");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_download_never_copies_persistently_incomplete_file() {
+    let (server, _src, attempts) = start_tdlib_download_server_with_interruptions(usize::MAX).await;
+    let outdir = TempDir::new().unwrap();
+    let target = outdir.path().join("must-not-exist.dat");
+    let output = tdctl_cmd(&server.socket_path)
+        .args([
+            "download",
+            "-1001234567890",
+            "5",
+            "--no-mark-read",
+            "--output",
+        ])
+        .arg(&target)
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!output.status.success());
+    assert_eq!(*attempts.lock().unwrap(), 5);
+    assert!(
+        stderr.contains("Download did not complete after 5 attempts"),
+        "stderr: {stderr}"
+    );
+    assert!(!target.exists(), "partial file must not be copied");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_download_to_stdout() {
     let (server, _src) = start_tdlib_download_server().await;
     let output = tdctl_cmd(&server.socket_path)
@@ -1349,10 +1470,7 @@ async fn test_download_no_media_errors() {
 
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(!output.status.success());
-    assert!(
-        stderr.contains("no downloadable media"),
-        "stderr: {stderr}"
-    );
+    assert!(stderr.contains("no downloadable media"), "stderr: {stderr}");
 }
 
 /// Like `start_tdlib_chat_server`, but also records every `viewMessages` request
@@ -1716,8 +1834,7 @@ async fn test_listen_human_album_coalesced() {
         "media_album_id": "999",
         "content": {"@type": "messagePhoto", "caption": {"text": "", "entities": []}}
     });
-    let server =
-        start_listen_server(vec![new_message_update(m1), new_message_update(m2)]).await;
+    let server = start_listen_server(vec![new_message_update(m1), new_message_update(m2)]).await;
     let output = tdctl_cmd(&server.socket_path)
         .args(["listen", "--no-mark-read"])
         .output()

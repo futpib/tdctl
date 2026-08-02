@@ -192,7 +192,7 @@ enum Command {
         #[arg(allow_hyphen_values = true)]
         chat: String,
 
-        /// Message ID to download from (as shown by get-history)
+        /// Message ID from get-history, or a raw TDLib ID from JSON output
         message_id: i64,
 
         /// Output path: a file, a directory, or "-" for stdout.
@@ -690,13 +690,98 @@ async fn mark_messages_read(
     Ok(())
 }
 
-/// Download a file by TDLib file id, blocking until the transfer completes.
-///
-/// Uses `synchronous: true` so TDLib delivers a terminal `file` result (correlated
-/// by `@extra`) even when the file is already cached — meaning we never hang waiting
-/// for an `updateFile` that won't come. When `progress` is set, intervening
-/// `updateFile` events for this file are rendered as a live progress line on stderr.
-async fn download_file(
+const DOWNLOAD_MAX_ATTEMPTS: usize = 5;
+
+fn download_is_complete(file: &serde_json::Value) -> bool {
+    file.get("@type").and_then(|v| v.as_str()) == Some("file")
+        && file
+            .pointer("/local/is_downloading_completed")
+            .and_then(|v| v.as_bool())
+            == Some(true)
+        && file
+            .pointer("/local/path")
+            .and_then(|v| v.as_str())
+            .is_some_and(|path| !path.is_empty())
+}
+
+fn download_can_retry(response: &serde_json::Value) -> bool {
+    if is_error_payload(response) {
+        let code = response.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
+        let message = response
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        return code >= 500
+            || message.contains("failed or was canceled")
+            || message.contains("RPC_CALL_FAIL");
+    }
+
+    if response.get("@type").and_then(|v| v.as_str()) != Some("file") {
+        return false;
+    }
+
+    let local = response.get("local");
+    let active = local
+        .and_then(|v| v.get("is_downloading_active"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let can_be_downloaded = local
+        .and_then(|v| v.get("can_be_downloaded"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    active || can_be_downloaded
+}
+
+fn download_state_summary(response: &serde_json::Value) -> String {
+    if is_error_payload(response) {
+        return response
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown TDLib error")
+            .to_string();
+    }
+
+    let downloaded = response
+        .pointer("/local/downloaded_size")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let total = response
+        .get("size")
+        .and_then(|v| v.as_u64())
+        .filter(|&size| size > 0)
+        .or_else(|| response.get("expected_size").and_then(|v| v.as_u64()));
+    let active = response
+        .pointer("/local/is_downloading_active")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let completed = response
+        .pointer("/local/is_downloading_completed")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let can_be_downloaded = response
+        .pointer("/local/can_be_downloaded")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let progress = total.map_or_else(
+        || format!("{} downloaded", format_bytes(downloaded)),
+        |total| {
+            format!(
+                "{} of {} downloaded",
+                format_bytes(downloaded),
+                format_bytes(total)
+            )
+        },
+    );
+
+    format!(
+        "{progress}; active={active}, completed={completed}, can_be_downloaded={can_be_downloaded}"
+    )
+}
+
+/// Send one synchronous download request and return its correlated response.
+/// TDLib may return an incomplete `file` when the transfer fails, is cancelled,
+/// or is superseded, so callers must inspect the local download state.
+async fn download_file_once(
     reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
     writer: &mut BufWriter<tokio::net::unix::OwnedWriteHalf>,
     account: Option<u32>,
@@ -706,7 +791,7 @@ async fn download_file(
     let mut payload = serde_json::json!({
         "@type": "downloadFile",
         "file_id": file_id,
-        "priority": 1,
+        "priority": 32,
         "offset": 0,
         "limit": 0,
         "synchronous": true,
@@ -757,6 +842,97 @@ async fn download_file(
             }
         }
     }
+}
+
+/// Download a file by TDLib file id, retrying resumable interruptions until the
+/// transfer is explicitly reported complete.
+///
+async fn download_file(
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    writer: &mut BufWriter<tokio::net::unix::OwnedWriteHalf>,
+    account: Option<u32>,
+    file_id: i64,
+    progress: bool,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let retry_delays_ms = [250, 500, 1_000, 2_000];
+    let mut last_response = serde_json::Value::Null;
+
+    for attempt in 1..=DOWNLOAD_MAX_ATTEMPTS {
+        let response = download_file_once(reader, writer, account, file_id, progress).await?;
+        if download_is_complete(&response) {
+            return Ok(response);
+        }
+
+        if !download_can_retry(&response) {
+            if is_error_payload(&response) {
+                return Ok(response);
+            }
+            return Err(format!(
+                "Download cannot continue ({})",
+                download_state_summary(&response)
+            )
+            .into());
+        }
+
+        last_response = response;
+        if attempt < DOWNLOAD_MAX_ATTEMPTS {
+            eprintln!(
+                "Download interrupted before completion; resuming (attempt {}/{DOWNLOAD_MAX_ATTEMPTS})...",
+                attempt + 1
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(
+                retry_delays_ms[attempt - 1],
+            ))
+            .await;
+        }
+    }
+
+    Err(format!(
+        "Download did not complete after {DOWNLOAD_MAX_ATTEMPTS} attempts ({})",
+        download_state_summary(&last_response)
+    )
+    .into())
+}
+
+fn raw_tdlib_message_id(message_id: i64) -> Option<TdlibMessageId> {
+    const TDLIB_MESSAGE_ID_ALIGNMENT: i64 = 1 << 20;
+    (message_id > 0 && message_id % TDLIB_MESSAGE_ID_ALIGNMENT == 0)
+        .then_some(TdlibMessageId(message_id))
+}
+
+fn is_not_found(payload: &serde_json::Value) -> bool {
+    is_error_payload(payload)
+        && (payload.get("code").and_then(|v| v.as_i64()) == Some(404)
+            || payload.get("message").and_then(|v| v.as_str()) == Some("Not Found"))
+}
+
+async fn get_download_message(
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    writer: &mut BufWriter<tokio::net::unix::OwnedWriteHalf>,
+    account: Option<u32>,
+    chat_id: i64,
+    message_id: i64,
+) -> Result<(serde_json::Value, TdlibMessageId), Box<dyn std::error::Error>> {
+    let mtp_id: TdlibMessageId = MtpMessageId(message_id).into();
+    let request = |id: TdlibMessageId| {
+        serde_json::json!({
+            "@type": "getMessage",
+            "chat_id": chat_id,
+            "message_id": id.0,
+        })
+    };
+    let response = send_tdlib_request_with_retry(reader, writer, account, request(mtp_id)).await?;
+
+    if is_not_found(&response)
+        && let Some(raw_id) = raw_tdlib_message_id(message_id)
+        && raw_id != mtp_id
+    {
+        let raw_response =
+            send_tdlib_request_with_retry(reader, writer, account, request(raw_id)).await?;
+        return Ok((raw_response, raw_id));
+    }
+
+    Ok((response, mtp_id))
 }
 
 async fn resolve_chat(
@@ -1266,7 +1442,11 @@ fn message_flag_segments(msg: &serde_json::Value) -> String {
     if msg.get("edit_date").and_then(|v| v.as_i64()).unwrap_or(0) > 0 {
         segs.push("(edited)".to_string());
     }
-    if msg.get("forward_info").map(|v| !v.is_null()).unwrap_or(false) {
+    if msg
+        .get("forward_info")
+        .map(|v| !v.is_null())
+        .unwrap_or(false)
+    {
         segs.push("forwarded".to_string());
     }
     if let Some(reply_id) = reply_target_mtp(msg) {
@@ -1319,7 +1499,11 @@ fn format_listen_album(buf: &[(serde_json::Value, i64, i64)]) -> String {
     if first.get("edit_date").and_then(|v| v.as_i64()).unwrap_or(0) > 0 {
         segs.push("(edited)".to_string());
     }
-    if first.get("forward_info").map(|v| !v.is_null()).unwrap_or(false) {
+    if first
+        .get("forward_info")
+        .map(|v| !v.is_null())
+        .unwrap_or(false)
+    {
         segs.push("forwarded".to_string());
     }
     if let Some(reply_id) = reply_target_mtp(first) {
@@ -1704,9 +1888,7 @@ fn format_bytes(bytes: u64) -> String {
 
 /// Locate the downloadable file inside a message's content, returning its TDLib
 /// file id and the original file name when the media type carries one.
-fn extract_downloadable_file(
-    content: Option<&serde_json::Value>,
-) -> Option<(i64, Option<String>)> {
+fn extract_downloadable_file(content: Option<&serde_json::Value>) -> Option<(i64, Option<String>)> {
     let content = content?;
     let named = |obj: &serde_json::Value| -> Option<String> {
         obj.get("file_name")
@@ -3012,15 +3194,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
 
         let chat_id = resolve_chat(&mut reader, &mut writer, account, &chat).await?;
-        let tdlib_message_id: TdlibMessageId = MtpMessageId(message_id).into();
-
-        let payload = serde_json::json!({
-            "@type": "getMessage",
-            "chat_id": chat_id,
-            "message_id": tdlib_message_id.0,
-        });
-        let message =
-            send_tdlib_request_with_retry(&mut reader, &mut writer, account, payload).await?;
+        let (message, tdlib_message_id) =
+            get_download_message(&mut reader, &mut writer, account, chat_id, message_id).await?;
         if is_error_payload(&message) {
             let msg = message
                 .get("message")
@@ -3036,8 +3211,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })?;
 
         let show_progress = std::io::stderr().is_terminal();
-        let file =
-            download_file(&mut reader, &mut writer, account, file_id, show_progress).await?;
+        let file = download_file(&mut reader, &mut writer, account, file_id, show_progress).await?;
         if is_error_payload(&file) {
             let msg = file
                 .get("message")
@@ -3051,15 +3225,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|l| l.get("path"))
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
-            .ok_or("download finished but TDLib returned no local path")?;
+            .ok_or("TDLib reported a completed download without a local path")?;
         let size = file
             .get("size")
             .and_then(|v| v.as_u64())
             .filter(|&s| s > 0)
             .or_else(|| file.get("expected_size").and_then(|v| v.as_u64()))
             .unwrap_or(0);
+        let actual_size = std::fs::metadata(local_path)?.len();
+        if size > 0 && actual_size < size {
+            return Err(format!(
+                "Downloaded file is incomplete: {} has {} but TDLib expected {}",
+                local_path,
+                format_bytes(actual_size),
+                format_bytes(size)
+            )
+            .into());
+        }
 
-        let to_stdout = output.as_ref().map(|p| p.as_os_str() == "-").unwrap_or(false);
+        let to_stdout = output
+            .as_ref()
+            .map(|p| p.as_os_str() == "-")
+            .unwrap_or(false);
 
         if to_stdout {
             let bytes = std::fs::read(local_path)?;

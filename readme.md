@@ -72,8 +72,9 @@ audio, animations, voice/video notes, and stickers.
 tdctl download [OPTIONS] <CHAT> <MESSAGE_ID>
 ```
 
-`<CHAT>` is a numeric chat ID or `@username`. `<MESSAGE_ID>` is the message ID as
-printed by `get-history`.
+`<CHAT>` is a numeric chat ID or `@username`. `<MESSAGE_ID>` is the compact message
+ID printed by `get-history`; raw TDLib message IDs emitted by JSON output are also
+accepted.
 
 - `-o, --output <PATH>` — Where to write the file. If `PATH` is an existing
   directory, the media is saved inside it under its original file name. Use `-`
@@ -82,8 +83,10 @@ printed by `get-history`.
 - `--mark-read` / `--no-mark-read` — Mark the message as read on the server, or
   not. Overrides the config (see [Configuration](#configuration)).
 
-The command blocks until the download finishes. The resulting file path is
-printed to stdout; progress and status are written to stderr.
+The command blocks until TDLib reports the download complete. Interrupted
+transfers are resumed a bounded number of times, and incomplete files are never
+copied to the requested output. The resulting file path is printed to stdout;
+progress and status are written to stderr.
 
 ```
 tdctl download @user 185 -o ./photo.jpg
