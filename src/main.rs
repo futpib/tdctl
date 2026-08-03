@@ -143,6 +143,12 @@ enum Command {
         send_timeout: u64,
     },
 
+    /// Add or remove a reaction on a message
+    Reaction {
+        #[command(subcommand)]
+        command: ReactionCommand,
+    },
+
     /// Search for chats by name or username
     SearchChats {
         /// Search query
@@ -272,6 +278,69 @@ enum MtpCommand {
     Raw {
         /// JSON to send as payload (reads from stdin if omitted)
         json: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReactionCommand {
+    /// Add a reaction to a message
+    Add {
+        /// Chat ID or @username
+        #[arg(allow_hyphen_values = true)]
+        chat: String,
+
+        /// Message ID from get-history, or a raw TDLib ID from JSON output
+        message_id: i64,
+
+        /// Emoji reaction to add
+        #[arg(
+            value_name = "EMOJI",
+            required_unless_present = "custom_emoji_id",
+            conflicts_with = "custom_emoji_id"
+        )]
+        emoji: Option<String>,
+
+        /// Custom emoji identifier to use as the reaction
+        #[arg(
+            long,
+            value_name = "ID",
+            value_parser = clap::value_parser!(i64).range(1..)
+        )]
+        custom_emoji_id: Option<i64>,
+
+        /// Play the big reaction animation
+        #[arg(long)]
+        big: bool,
+
+        /// Do not add the reaction to the recent-reactions list
+        #[arg(long)]
+        no_update_recent: bool,
+    },
+
+    /// Remove a reaction from a message
+    Remove {
+        /// Chat ID or @username
+        #[arg(allow_hyphen_values = true)]
+        chat: String,
+
+        /// Message ID from get-history, or a raw TDLib ID from JSON output
+        message_id: i64,
+
+        /// Emoji reaction to remove
+        #[arg(
+            value_name = "EMOJI",
+            required_unless_present = "custom_emoji_id",
+            conflicts_with = "custom_emoji_id"
+        )]
+        emoji: Option<String>,
+
+        /// Custom emoji identifier to use as the reaction
+        #[arg(
+            long,
+            value_name = "ID",
+            value_parser = clap::value_parser!(i64).range(1..)
+        )]
+        custom_emoji_id: Option<i64>,
     },
 }
 
@@ -898,6 +967,38 @@ fn raw_tdlib_message_id(message_id: i64) -> Option<TdlibMessageId> {
     const TDLIB_MESSAGE_ID_ALIGNMENT: i64 = 1 << 20;
     (message_id > 0 && message_id % TDLIB_MESSAGE_ID_ALIGNMENT == 0)
         .then_some(TdlibMessageId(message_id))
+}
+
+/// Interpret the compact IDs printed by tdctl while preserving raw TDLib IDs
+/// copied from JSON output. Reaction commands mutate state, so they must choose
+/// the intended ID before sending instead of probing a second candidate.
+fn reaction_message_id(message_id: i64) -> TdlibMessageId {
+    raw_tdlib_message_id(message_id)
+        .unwrap_or_else(|| TdlibMessageId::from(MtpMessageId(message_id)))
+}
+
+fn reaction_type(
+    emoji: Option<String>,
+    custom_emoji_id: Option<i64>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    if let Some(custom_emoji_id) = custom_emoji_id {
+        if custom_emoji_id <= 0 {
+            return Err("custom emoji ID must be positive".into());
+        }
+        return Ok(serde_json::json!({
+            "@type": "reactionTypeCustomEmoji",
+            "custom_emoji_id": custom_emoji_id,
+        }));
+    }
+
+    let emoji = emoji.ok_or("an emoji or --custom-emoji-id is required")?;
+    if emoji.is_empty() {
+        return Err("emoji reaction must not be empty".into());
+    }
+    Ok(serde_json::json!({
+        "@type": "reactionTypeEmoji",
+        "emoji": emoji,
+    }))
 }
 
 fn is_not_found(payload: &serde_json::Value) -> bool {
@@ -2314,6 +2415,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         Command::GetHistory { .. } => (None, Envelope::Tdlib),
         Command::SendMessage { .. } => (None, Envelope::Tdlib),
+        Command::Reaction { .. } => (None, Envelope::Tdlib),
         Command::SearchChats { .. } => (None, Envelope::Tdlib),
         Command::ListAccounts => (None, Envelope::Tdesktop),
         Command::Export { .. } => (None, Envelope::Tdesktop),
@@ -2688,6 +2790,76 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 println!("{}", parts.join("\t"));
             }
+        }
+
+        return Ok(());
+    }
+
+    if let Command::Reaction { command } = cli.command {
+        let (
+            action,
+            chat,
+            message_id,
+            payload_type,
+            reaction_type,
+            is_big,
+            update_recent_reactions,
+        ) = match command {
+            ReactionCommand::Add {
+                chat,
+                message_id,
+                emoji,
+                custom_emoji_id,
+                big,
+                no_update_recent,
+            } => (
+                "add",
+                chat,
+                message_id,
+                "addMessageReaction",
+                reaction_type(emoji, custom_emoji_id)?,
+                Some(big),
+                Some(!no_update_recent),
+            ),
+            ReactionCommand::Remove {
+                chat,
+                message_id,
+                emoji,
+                custom_emoji_id,
+            } => (
+                "remove",
+                chat,
+                message_id,
+                "removeMessageReaction",
+                reaction_type(emoji, custom_emoji_id)?,
+                None,
+                None,
+            ),
+        };
+
+        let chat_id = resolve_chat(&mut reader, &mut writer, account, &chat).await?;
+        let tdlib_message_id = reaction_message_id(message_id);
+        let mut payload = serde_json::json!({
+            "@type": payload_type,
+            "chat_id": chat_id,
+            "message_id": tdlib_message_id.0,
+            "reaction_type": reaction_type,
+        });
+        if let Some(is_big) = is_big {
+            payload["is_big"] = serde_json::json!(is_big);
+        }
+        if let Some(update_recent_reactions) = update_recent_reactions {
+            payload["update_recent_reactions"] = serde_json::json!(update_recent_reactions);
+        }
+
+        let response =
+            send_tdlib_request_with_retry(&mut reader, &mut writer, account, payload).await?;
+        if is_error_payload(&response) {
+            let message = response
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            return Err(format!("Failed to {action} reaction: {message}").into());
         }
 
         return Ok(());

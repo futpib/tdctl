@@ -1888,3 +1888,164 @@ async fn test_get_history_config_disables_mark_read() {
         "config mark_read=false should suppress viewMessages"
     );
 }
+
+async fn start_reaction_server(
+    fail_reaction: bool,
+) -> (MockServer, Arc<Mutex<Vec<serde_json::Value>>>) {
+    let tempdir = TempDir::new().unwrap();
+    let socket_path = tempdir.path().join("test.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    let reactions = Arc::new(Mutex::new(Vec::new()));
+    let server_reactions = Arc::clone(&reactions);
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let reactions = Arc::clone(&server_reactions);
+            tokio::spawn(async move {
+                let (rd, mut wr) = stream.into_split();
+                let mut reader = BufReader::new(rd);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    let n = reader.read_line(&mut line).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+
+                    let envelope: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                    let payload = &envelope["payload"];
+                    let extra = payload.get("@extra").cloned();
+                    let request_type = payload.get("@type").and_then(|v| v.as_str()).unwrap_or("");
+                    let mut response = match request_type {
+                        "searchPublicChat" => serde_json::json!({
+                            "@type": "chat",
+                            "id": -1001234567890_i64,
+                            "title": "Reaction Test",
+                        }),
+                        "addMessageReaction" | "removeMessageReaction" => {
+                            let mut recorded = payload.clone();
+                            recorded.as_object_mut().unwrap().remove("@extra");
+                            reactions.lock().unwrap().push(recorded);
+                            if fail_reaction {
+                                serde_json::json!({
+                                    "@type": "error",
+                                    "code": 400,
+                                    "message": "REACTION_INVALID",
+                                })
+                            } else {
+                                serde_json::json!({"@type": "ok"})
+                            }
+                        }
+                        other => serde_json::json!({
+                            "@type": "error",
+                            "code": 400,
+                            "message": format!("unexpected request: {other}"),
+                        }),
+                    };
+                    if let Some(extra) = extra {
+                        response["@extra"] = extra;
+                    }
+                    let response = serde_json::json!({
+                        "type": "tdlib",
+                        "payload": response,
+                    });
+                    wr.write_all(serde_json::to_string(&response).unwrap().as_bytes())
+                        .await
+                        .unwrap();
+                    wr.write_all(b"\n").await.unwrap();
+                    wr.flush().await.unwrap();
+                }
+            });
+        }
+    });
+
+    (
+        MockServer {
+            socket_path,
+            _tempdir: tempdir,
+        },
+        reactions,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_add_emoji_reaction() {
+    let (server, reactions) = start_reaction_server(false).await;
+    let output = tdctl_cmd(&server.socket_path)
+        .args([
+            "reaction",
+            "add",
+            "@someone",
+            "42",
+            "👍",
+            "--big",
+            "--no-update-recent",
+        ])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        reactions.lock().unwrap().as_slice(),
+        &[serde_json::json!({
+            "@type": "addMessageReaction",
+            "chat_id": -1001234567890_i64,
+            "message_id": 42_i64 << 20,
+            "reaction_type": {
+                "@type": "reactionTypeEmoji",
+                "emoji": "👍",
+            },
+            "is_big": true,
+            "update_recent_reactions": false,
+        })]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_remove_custom_reaction_accepts_raw_tdlib_message_id() {
+    let (server, reactions) = start_reaction_server(false).await;
+    let raw_message_id = 42_i64 << 20;
+    let custom_emoji_id = 5_368_324_170_671_202_286_i64;
+    let output = tdctl_cmd(&server.socket_path)
+        .args([
+            "reaction",
+            "remove",
+            "777",
+            raw_message_id.to_string().as_str(),
+            "--custom-emoji-id",
+            custom_emoji_id.to_string().as_str(),
+        ])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert_eq!(
+        reactions.lock().unwrap().as_slice(),
+        &[serde_json::json!({
+            "@type": "removeMessageReaction",
+            "chat_id": 777,
+            "message_id": raw_message_id,
+            "reaction_type": {
+                "@type": "reactionTypeCustomEmoji",
+                "custom_emoji_id": custom_emoji_id,
+            },
+        })]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_add_reaction_surfaces_tdlib_error() {
+    let (server, _) = start_reaction_server(true).await;
+    let output = tdctl_cmd(&server.socket_path)
+        .args(["reaction", "add", "777", "42", "👍"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!output.status.success());
+    assert!(stderr.contains("REACTION_INVALID"), "stderr: {stderr}");
+}

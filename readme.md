@@ -125,6 +125,30 @@ tdctl send-message @user --document ./report.pdf
 tdctl send-message @user "Reply" --reply-to 42
 ```
 
+#### `reaction`
+
+Add or remove a reaction on a message.
+
+```
+tdctl reaction add [OPTIONS] <CHAT> <MESSAGE_ID> [EMOJI]
+tdctl reaction remove [OPTIONS] <CHAT> <MESSAGE_ID> [EMOJI]
+```
+
+`<CHAT>` is a numeric chat ID or `@username`. `<MESSAGE_ID>` is the compact
+message ID printed by `get-history`; raw TDLib message IDs from JSON output are
+also accepted.
+
+- `--custom-emoji-id <ID>` — Use a custom emoji reaction instead of `[EMOJI]`
+- `--big` — Play the big reaction animation when adding a reaction
+- `--no-update-recent` — Do not add the reaction to the recent-reactions list
+  when adding a reaction
+
+```
+tdctl reaction add @user 185 '👍'
+tdctl reaction add @user 185 --custom-emoji-id 5368324170671202286
+tdctl reaction remove @user 185 '👍'
+```
+
 #### `search-chats`
 
 Search for chats by name or username. Combines server-side and public search results.
